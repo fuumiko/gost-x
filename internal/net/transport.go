@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	bufferSize = 64 * 1024
+	bufferSize = 16 * 1024
 )
 
 func Transport(rw1, rw2 io.ReadWriter) error {
