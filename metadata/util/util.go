@@ -27,16 +27,17 @@ func GetBool(md metadata.Metadata, keys ...string) (v bool) {
 	}
 
 	for _, key := range keys {
-		if !md.IsExists(key) {
+		vv := md.Get(key)
+		if vv == nil {
 			continue
 		}
-		switch vv := md.Get(key).(type) {
+		switch val := vv.(type) {
 		case bool:
-			v = vv
+			v = val
 		case int:
-			v = vv != 0
+			v = val != 0
 		case string:
-			v, _ = strconv.ParseBool(vv)
+			v, _ = strconv.ParseBool(val)
 		}
 		break
 	}
@@ -50,18 +51,19 @@ func GetInt(md metadata.Metadata, keys ...string) (v int) {
 	}
 
 	for _, key := range keys {
-		if !md.IsExists(key) {
+		vv := md.Get(key)
+		if vv == nil {
 			continue
 		}
-		switch vv := md.Get(key).(type) {
+		switch val := vv.(type) {
 		case bool:
-			if vv {
+			if val {
 				v = 1
 			}
 		case int:
-			v = vv
+			v = val
 		case string:
-			v, _ = strconv.Atoi(vv)
+			v, _ = strconv.Atoi(val)
 		}
 		break
 	}
@@ -75,17 +77,18 @@ func GetFloat(md metadata.Metadata, keys ...string) (v float64) {
 	}
 
 	for _, key := range keys {
-		if !md.IsExists(key) {
+		vv := md.Get(key)
+		if vv == nil {
 			continue
 		}
 
-		switch vv := md.Get(key).(type) {
+		switch val := vv.(type) {
 		case float64:
-			v = vv
+			v = val
 		case int:
-			v = float64(vv)
+			v = float64(val)
 		case string:
-			v, _ = strconv.ParseFloat(vv, 64)
+			v, _ = strconv.ParseFloat(val, 64)
 		}
 		break
 	}
@@ -98,17 +101,18 @@ func GetDuration(md metadata.Metadata, keys ...string) (v time.Duration) {
 	}
 
 	for _, key := range keys {
-		if !md.IsExists(key) {
+		vv := md.Get(key)
+		if vv == nil {
 			continue
 		}
 
-		switch vv := md.Get(key).(type) {
+		switch val := vv.(type) {
 		case int:
-			v = time.Duration(vv) * time.Second
+			v = time.Duration(val) * time.Second
 		case string:
-			v, _ = time.ParseDuration(vv)
+			v, _ = time.ParseDuration(val)
 			if v == 0 {
-				n, _ := strconv.Atoi(vv)
+				n, _ := strconv.Atoi(val)
 				v = time.Duration(n) * time.Second
 			}
 		}
@@ -123,27 +127,28 @@ func GetString(md metadata.Metadata, keys ...string) (v string) {
 	}
 
 	for _, key := range keys {
-		if !md.IsExists(key) {
+		vv := md.Get(key)
+		if vv == nil {
 			continue
 		}
 
-		switch vv := md.Get(key).(type) {
+		switch val := vv.(type) {
 		case string:
-			v = vv
+			v = val
 		case int:
-			v = strconv.FormatInt(int64(vv), 10)
+			v = strconv.FormatInt(int64(val), 10)
 		case int64:
-			v = strconv.FormatInt(vv, 10)
+			v = strconv.FormatInt(val, 10)
 		case uint:
-			v = strconv.FormatUint(uint64(vv), 10)
+			v = strconv.FormatUint(uint64(val), 10)
 		case uint64:
-			v = strconv.FormatUint(uint64(vv), 10)
+			v = strconv.FormatUint(uint64(val), 10)
 		case bool:
-			v = strconv.FormatBool(vv)
+			v = strconv.FormatBool(val)
 		case float32:
-			v = strconv.FormatFloat(float64(vv), 'f', -1, 32)
+			v = strconv.FormatFloat(float64(val), 'f', -1, 32)
 		case float64:
-			v = strconv.FormatFloat(float64(vv), 'f', -1, 64)
+			v = strconv.FormatFloat(float64(val), 'f', -1, 64)
 		}
 		break
 	}
@@ -157,16 +162,17 @@ func GetStrings(md metadata.Metadata, keys ...string) (ss []string) {
 	}
 
 	for _, key := range keys {
-		if !md.IsExists(key) {
+		vv := md.Get(key)
+		if vv == nil {
 			continue
 		}
 
-		switch v := md.Get(key).(type) {
+		switch val := vv.(type) {
 		case []string:
-			ss = v
+			ss = val
 		case []any:
-			for _, vv := range v {
-				if s, ok := vv.(string); ok {
+			for _, v := range val {
+				if s, ok := v.(string); ok {
 					ss = append(ss, s)
 				}
 			}
@@ -182,16 +188,17 @@ func GetStringMap(md metadata.Metadata, keys ...string) (m map[string]any) {
 	}
 
 	for _, key := range keys {
-		if !md.IsExists(key) {
+		vv := md.Get(key)
+		if vv == nil {
 			continue
 		}
 
-		switch vv := md.Get(key).(type) {
+		switch val := vv.(type) {
 		case map[string]any:
-			m = vv
+			m = val
 		case map[any]any:
 			m = make(map[string]any)
-			for k, v := range vv {
+			for k, v := range val {
 				m[fmt.Sprintf("%v", k)] = v
 			}
 		}
@@ -206,19 +213,20 @@ func GetStringMapString(md metadata.Metadata, keys ...string) (m map[string]stri
 	}
 
 	for _, key := range keys {
-		if !md.IsExists(key) {
+		vv := md.Get(key)
+		if vv == nil {
 			continue
 		}
 
-		switch vv := md.Get(key).(type) {
+		switch val := vv.(type) {
 		case map[string]any:
 			m = make(map[string]string)
-			for k, v := range vv {
+			for k, v := range val {
 				m[k] = fmt.Sprintf("%v", v)
 			}
 		case map[any]any:
 			m = make(map[string]string)
-			for k, v := range vv {
+			for k, v := range val {
 				m[fmt.Sprintf("%v", k)] = fmt.Sprintf("%v", v)
 			}
 		}

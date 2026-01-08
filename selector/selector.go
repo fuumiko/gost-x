@@ -10,7 +10,7 @@ import (
 // default options for FailFilter
 const (
 	DefaultMaxFails    = 1
-	DefaultFailTimeout = 10 * time.Second
+	DefaultFailTimeout = 3 * time.Second
 )
 
 const (

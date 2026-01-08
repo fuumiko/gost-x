@@ -11,7 +11,7 @@ type randomWeightedItem[T any] struct {
 }
 
 type RandomWeighted[T any] struct {
-	items []*randomWeightedItem[T]
+	items []randomWeightedItem[T]
 	sum   int
 	r     *rand.Rand
 }
@@ -23,8 +23,7 @@ func NewRandomWeighted[T any]() *RandomWeighted[T] {
 }
 
 func (rw *RandomWeighted[T]) Add(item T, weight int) {
-	ri := &randomWeightedItem[T]{item: item, weight: weight}
-	rw.items = append(rw.items, ri)
+	rw.items = append(rw.items, randomWeightedItem[T]{item: item, weight: weight})
 	rw.sum += weight
 }
 
@@ -33,13 +32,13 @@ func (rw *RandomWeighted[T]) Next() (v T) {
 		return
 	}
 	if rw.sum <= 0 {
-		return
+		return rw.items[0].item
 	}
 	weight := rw.r.Intn(rw.sum) + 1
-	for _, item := range rw.items {
-		weight -= item.weight
+	for i := range rw.items {
+		weight -= rw.items[i].weight
 		if weight <= 0 {
-			return item.item
+			return rw.items[i].item
 		}
 	}
 
@@ -47,6 +46,6 @@ func (rw *RandomWeighted[T]) Next() (v T) {
 }
 
 func (rw *RandomWeighted[T]) Reset() {
-	rw.items = nil
+	rw.items = rw.items[:0]
 	rw.sum = 0
 }

@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/go-gost/core/metadata"
-	mdutil "github.com/go-gost/x/metadata/util"
 	"github.com/go-gost/core/selector"
+	mdutil "github.com/go-gost/x/metadata/util"
 )
 
 type failFilter[T any] struct {
@@ -28,8 +28,8 @@ func (f *failFilter[T]) Filter(ctx context.Context, vs ...T) []T {
 	if len(vs) <= 1 {
 		return vs
 	}
-	var l []T
-	for _, v := range vs {
+
+	for i, v := range vs {
 		maxFails := f.maxFails
 		failTimeout := f.failTimeout
 		if mi, _ := any(v).(metadata.Metadatable); mi != nil {
@@ -49,18 +49,57 @@ func (f *failFilter[T]) Filter(ctx context.Context, vs ...T) []T {
 			failTimeout = DefaultFailTimeout
 		}
 
+		dead := false
 		if mi, _ := any(v).(selector.Markable); mi != nil {
 			if marker := mi.Marker(); marker != nil {
-				if marker.Count() < int64(maxFails) ||
-					time.Since(marker.Time()) >= failTimeout {
-					l = append(l, v)
+				if marker.Count() >= int64(maxFails) &&
+					time.Since(marker.Time()) < failTimeout {
+					dead = true
 				}
-				continue
 			}
 		}
-		l = append(l, v)
+
+		if dead {
+			l := make([]T, 0, len(vs)-1)
+			l = append(l, vs[:i]...)
+			for _, v := range vs[i+1:] {
+				maxFails := f.maxFails
+				failTimeout := f.failTimeout
+				if mi, _ := any(v).(metadata.Metadatable); mi != nil {
+					if md := mi.Metadata(); md != nil {
+						if md.IsExists(labelMaxFails) {
+							maxFails = mdutil.GetInt(md, labelMaxFails)
+						}
+						if md.IsExists(labelFailTimeout) {
+							failTimeout = mdutil.GetDuration(md, labelFailTimeout)
+						}
+					}
+				}
+				if maxFails <= 0 {
+					maxFails = 1
+				}
+				if failTimeout <= 0 {
+					failTimeout = DefaultFailTimeout
+				}
+
+				healthy := true
+				if mi, _ := any(v).(selector.Markable); mi != nil {
+					if marker := mi.Marker(); marker != nil {
+						if marker.Count() >= int64(maxFails) &&
+							time.Since(marker.Time()) < failTimeout {
+							healthy = false
+						}
+					}
+				}
+				if healthy {
+					l = append(l, v)
+				}
+			}
+			return l
+		}
 	}
-	return l
+
+	return vs
 }
 
 type backupFilter[T any] struct{}
@@ -77,19 +116,32 @@ func (f *backupFilter[T]) Filter(ctx context.Context, vs ...T) []T {
 		return vs
 	}
 
-	var l, backups []T
-	for _, v := range vs {
+	for i, v := range vs {
 		if mi, _ := any(v).(metadata.Metadatable); mi != nil {
 			if mdutil.GetBool(mi.Metadata(), labelBackup) {
+				// Found a backup node, start filtering
+				l := make([]T, 0, len(vs)-1)
+				l = append(l, vs[:i]...)
+				var backups []T
 				backups = append(backups, v)
-				continue
+
+				for _, v := range vs[i+1:] {
+					if mi, _ := any(v).(metadata.Metadatable); mi != nil {
+						if mdutil.GetBool(mi.Metadata(), labelBackup) {
+							backups = append(backups, v)
+							continue
+						}
+					}
+					l = append(l, v)
+				}
+
+				if len(l) == 0 {
+					return backups
+				}
+				return l
 			}
 		}
-		l = append(l, v)
 	}
 
-	if len(l) == 0 {
-		return backups
-	}
-	return l
+	return vs
 }
