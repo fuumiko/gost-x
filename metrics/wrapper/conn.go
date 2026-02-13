@@ -30,6 +30,9 @@ func WrapConn(service string, c net.Conn) net.Conn {
 	if c == nil {
 		return c
 	}
+	if !xmetrics.IsWrapperEnabled() {
+		return c
+	}
 
 	host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
 
@@ -105,6 +108,9 @@ func WrapPacketConn(service string, pc net.PacketConn) net.PacketConn {
 	if pc == nil {
 		return pc
 	}
+	if !xmetrics.IsWrapperEnabled() {
+		return pc
+	}
 	return &packetConn{
 		PacketConn: pc,
 		service:    service,
@@ -162,6 +168,11 @@ type udpConn struct {
 }
 
 func WrapUDPConn(service string, pc net.PacketConn) udp.Conn {
+	if !xmetrics.IsWrapperEnabled() {
+		return &udpConn{
+			PacketConn: pc,
+		}
+	}
 	return &udpConn{
 		PacketConn: pc,
 		service:    service,

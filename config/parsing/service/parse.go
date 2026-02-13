@@ -32,6 +32,7 @@ import (
 	cache_limiter "github.com/go-gost/x/limiter/traffic/cache"
 	"github.com/go-gost/x/metadata"
 	mdutil "github.com/go-gost/x/metadata/util"
+	xmetrics "github.com/go-gost/x/metrics"
 	xstats "github.com/go-gost/x/observer/stats"
 	"github.com/go-gost/x/registry"
 	xservice "github.com/go-gost/x/service"
@@ -131,6 +132,9 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 
 		if mdutil.GetBool(md, parsing.MDKeyEnableStats) {
 			pStats = xstats.NewStats(mdutil.GetBool(md, parsing.MDKeyObserverResetTraffic))
+		}
+		if mdutil.GetBool(md, parsing.MDKeyEnableMetrics) {
+			xmetrics.EnableWrapper(true)
 		}
 		observerPeriod = mdutil.GetDuration(md, parsing.MDKeyObserverPeriod, "observePeriod")
 

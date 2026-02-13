@@ -32,14 +32,23 @@ const (
 var (
 	defaultMetrics metrics.Metrics = NewMetrics()
 	enabled        atomic.Bool
+	wrapperEnabled atomic.Bool
 )
 
 func Enable(b bool) {
 	enabled.Store(b)
 }
 
+func EnableWrapper(b bool) {
+	wrapperEnabled.Store(b)
+}
+
 func IsEnabled() bool {
 	return enabled.Load()
+}
+
+func IsWrapperEnabled() bool {
+	return wrapperEnabled.Load()
 }
 
 func GetCounter(name metrics.MetricName, labels metrics.Labels) metrics.Counter {

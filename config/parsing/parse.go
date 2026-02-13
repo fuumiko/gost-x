@@ -11,6 +11,7 @@ const (
 	MDKeyPostDown      = "postDown"
 	MDKeyIgnoreChain   = "ignoreChain"
 	MDKeyEnableStats   = "enableStats"
+	MDKeyEnableMetrics = "enableMetrics"
 
 	MDKeyRecorderDirection       = "direction"
 	MDKeyRecorderTimestampFormat = "timeStampFormat"
