@@ -13,6 +13,13 @@ import (
 const (
 	// tcpWaitTimeout implements a TCP half-close timeout.
 	tcpWaitTimeout = 2 * time.Second
+
+	// Buffer sizes for asymmetric traffic patterns.
+	// In typical HTTP/HTTPS proxy scenarios:
+	// - Upload (client -> upstream): small requests, ACKs (8KB)
+	// - Download (upstream -> client): large responses, media (32KB)
+	uploadBufferSize   = 8 * 1024
+	downloadBufferSize = 32 * 1024
 )
 
 func Pipe(ctx context.Context, rw1, rw2 io.ReadWriteCloser) error {
@@ -23,13 +30,13 @@ func Pipe(ctx context.Context, rw1, rw2 io.ReadWriteCloser) error {
 
 	go func() {
 		defer wg.Done()
-		if err := pipeBuffer(rw1, rw2, bufferSize/2); err != nil {
+		if err := pipeBuffer(rw1, rw2, uploadBufferSize); err != nil {
 			ch <- err
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		if err := pipeBuffer(rw2, rw1, bufferSize/2); err != nil {
+		if err := pipeBuffer(rw2, rw1, downloadBufferSize); err != nil {
 			ch <- err
 		}
 	}()
