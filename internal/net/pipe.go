@@ -17,9 +17,9 @@ const (
 	// Buffer sizes for asymmetric traffic patterns.
 	// In typical HTTP/HTTPS proxy scenarios:
 	// - Upload (client -> upstream): small requests, ACKs (8KB)
-	// - Download (upstream -> client): large responses, media (32KB)
+	// - Download (upstream -> client): large responses, media (16KB)
 	uploadBufferSize   = 8 * 1024
-	downloadBufferSize = 32 * 1024
+	downloadBufferSize = 16 * 1024
 )
 
 func Pipe(ctx context.Context, rw1, rw2 io.ReadWriteCloser) error {
