@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-gost/core/observer/stats"
@@ -15,6 +17,58 @@ import (
 
 type serviceStatus interface {
 	Status() *service.Status
+}
+
+func fillServiceStatus(svc *config.ServiceConfig) {
+	s := registry.ServiceRegistry().Get(svc.Name)
+	ss, ok := s.(serviceStatus)
+	if ok && ss != nil {
+		status := ss.Status()
+		svc.Status = &config.ServiceStatus{
+			CreateTime: status.CreateTime().Unix(),
+			State:      string(status.State()),
+		}
+		if st := status.Stats(); st != nil {
+			svc.Status.Stats = &config.ServiceStats{
+				TotalConns:   st.Get(stats.KindTotalConns),
+				CurrentConns: st.Get(stats.KindCurrentConns),
+				TotalErrs:    st.Get(stats.KindTotalErrs),
+				InputBytes:   st.Get(stats.KindInputBytes),
+				OutputBytes:  st.Get(stats.KindOutputBytes),
+			}
+		}
+		var stopped bool
+		for _, qname := range svc.Quotas {
+			lim := registry.QuotaLimiterRegistry().Get(qname)
+			if lim == nil {
+				continue
+			}
+			qs := lim.Snapshot()
+			if qs.Blocked {
+				stopped = true
+			}
+			svc.Status.Quotas = append(svc.Status.Quotas, config.ServiceQuota{
+				Name:      qname,
+				Used:      qs.Used,
+				Limit:     qs.Limit,
+				StartsAt:  qs.StartsAtUnix,
+				ExpiresAt: qs.ExpiresAtUnix,
+				Active:    qs.Active,
+				Expired:   qs.Expired,
+				Blocked:   qs.Blocked,
+				Direction: qs.Direction,
+			})
+		}
+		svc.Status.StoppedByLimit = stopped
+		for _, ev := range status.Events() {
+			if !ev.Time.IsZero() {
+				svc.Status.Events = append(svc.Status.Events, config.ServiceEvent{
+					Time: ev.Time.Unix(),
+					Msg:  ev.Message,
+				})
+			}
+		}
+	}
 }
 
 // swagger:parameters getConfigRequest
@@ -49,32 +103,7 @@ func getConfig(ctx *gin.Context) {
 			if svc == nil {
 				continue
 			}
-			s := registry.ServiceRegistry().Get(svc.Name)
-			ss, ok := s.(serviceStatus)
-			if ok && ss != nil {
-				status := ss.Status()
-				svc.Status = &config.ServiceStatus{
-					CreateTime: status.CreateTime().Unix(),
-					State:      string(status.State()),
-				}
-				if st := status.Stats(); st != nil {
-					svc.Status.Stats = &config.ServiceStats{
-						TotalConns:   st.Get(stats.KindTotalConns),
-						CurrentConns: st.Get(stats.KindCurrentConns),
-						TotalErrs:    st.Get(stats.KindTotalErrs),
-						InputBytes:   st.Get(stats.KindInputBytes),
-						OutputBytes:  st.Get(stats.KindOutputBytes),
-					}
-				}
-				for _, ev := range status.Events() {
-					if !ev.Time.IsZero() {
-						svc.Status.Events = append(svc.Status.Events, config.ServiceEvent{
-							Time: ev.Time.Unix(),
-							Msg:  ev.Message,
-						})
-					}
-				}
-			}
+			fillServiceStatus(svc)
 		}
 		return nil
 	})
@@ -100,10 +129,11 @@ func getConfig(ctx *gin.Context) {
 
 // swagger:parameters saveConfigRequest
 type saveConfigRequest struct {
-	// output format, one of yaml|json, default is yaml.
+	// output format, one of yaml|json, default is derived from the file extension.
 	// in: query
 	Format string `form:"format" json:"format"`
-	// file path, default is gost.yaml|gost.json in current working directory.
+	// file path, default is the loaded config file, or gost.yaml|gost.json in
+	// the current working directory when no config file was loaded.
 	// in: query
 	Path string `form:"path" json:"path"`
 }
@@ -128,16 +158,31 @@ func saveConfig(ctx *gin.Context) {
 	var req saveConfigRequest
 	ctx.ShouldBindQuery(&req)
 
-	file := "gost.yaml"
-	switch req.Format {
-	case "json":
-		file = "gost.json"
-	default:
-		req.Format = "yaml"
+	file := req.Path
+	if file == "" {
+		// Default to the config file that was loaded (via -C), falling back to
+		// the current working directory when the config came from elsewhere.
+		file = config.ConfigFile()
 	}
-
-	if req.Path != "" {
-		file = req.Path
+	if file == "" {
+		file = "gost.yaml"
+		if req.Format == "json" {
+			file = "gost.json"
+		}
+	}
+	switch strings.ToLower(req.Format) {
+	case "json":
+		req.Format = "json"
+	case "yaml":
+		req.Format = "yaml"
+	default:
+		// Derive the format from the file extension so a loaded JSON config
+		// is saved back as JSON (ReadFile forces format from extension).
+		if strings.ToLower(filepath.Ext(file)) == ".json" {
+			req.Format = "json"
+		} else {
+			req.Format = "yaml"
+		}
 	}
 
 	f, err := os.Create(file)

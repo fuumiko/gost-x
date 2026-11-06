@@ -1,0 +1,228 @@
+package sniffing
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"strings"
+	"time"
+
+	"github.com/go-gost/core/logger"
+	"github.com/go-gost/core/observer/stats"
+	"github.com/go-gost/core/recorder"
+	xio "github.com/go-gost/x/internal/io"
+	xhttp "github.com/go-gost/x/internal/net/http"
+	xstats "github.com/go-gost/x/observer/stats"
+	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
+	xrecorder "github.com/go-gost/x/recorder"
+	"golang.org/x/net/http2"
+)
+
+// serveH2 handles HTTP/2 connections by reading the client preface and
+// proxying requests through an http2.Transport.
+func (h *Sniffer) serveH2(ctx context.Context, network string, conn net.Conn, ho *HandleOptions) error {
+	const expectedBody = "SM\r\n\r\n"
+
+	buf := make([]byte, len(expectedBody))
+	n, err := io.ReadFull(conn, buf)
+	if err != nil {
+		return fmt.Errorf("h2: error reading client preface: %s", err)
+	}
+	if string(buf[:n]) != expectedBody {
+		return errors.New("h2: invalid client preface")
+	}
+
+	ro := ho.RecorderObject
+	log := ho.Log
+
+	ro.Time = time.Time{}
+
+	tr := &http2.Transport{
+		DialTLSContext: func(ctx context.Context, nw, addr string, cfg *tls.Config) (net.Conn, error) {
+			if dial := ho.DialTLS; dial != nil {
+				return dial(ctx, network, addr, cfg)
+			}
+
+			cc, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+
+			log = log.WithFields(map[string]any{"src": cc.LocalAddr().String(), "dst": cc.RemoteAddr().String()})
+			ro.SrcAddr = cc.LocalAddr().String()
+			ro.DstAddr = cc.RemoteAddr().String()
+
+			cc = tls.Client(cc, cfg)
+			return cc, nil
+		},
+	}
+	defer tr.CloseIdleConnections()
+
+	(&http2.Server{}).ServeConn(conn, &http2.ServeConnOpts{
+		Context:          ctx,
+		SawClientPreface: true,
+		Handler: &h2Handler{
+			transport:       tr,
+			sessionRecorder: h.sessionRecorder(),
+			recorderOptions: h.RecorderOptions,
+			recorderObject:  ro,
+			log:             log,
+			handleOptions:   ho,
+			network:         network,
+		},
+	})
+	return nil
+}
+
+// h2Handler is an http.Handler that proxies HTTP/2 requests through an
+// http2.Transport while recording request and response metadata.
+type h2Handler struct {
+	transport       http.RoundTripper
+	sessionRecorder *xrecorder.SessionRecorder
+	recorderOptions *recorder.Options
+	recorderObject  *xrecorder.HandlerRecorderObject
+	log             logger.Logger
+	handleOptions   *HandleOptions
+	network         string
+}
+
+func (h *h2Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log := h.log
+
+	ro := &xrecorder.HandlerRecorderObject{}
+	*ro = *h.recorderObject
+
+	if v := r.Header.Get("Gost-Record"); v != "" {
+		ro.RecordMode = strings.ToLower(v)
+	}
+	r.Header.Del("Gost-Record")
+
+	ro.Time = time.Now()
+
+	var counters xstats.Stats
+	session := h.sessionRecorder.NewSession(r.Context(), &counters)
+
+	var err error
+	log.Infof("%s <-> %s", ro.RemoteAddr, r.Host)
+	defer func() {
+		ro.Duration = time.Since(ro.Time)
+		if err != nil {
+			ro.Err = err.Error()
+		}
+		ro.InputBytes = counters.Get(stats.KindInputBytes)
+		ro.OutputBytes = counters.Get(stats.KindOutputBytes)
+		if rerr := session.Finish(r.Context(), *ro); rerr != nil {
+			log.Errorf("record: %v", rerr)
+		}
+
+		log.WithFields(map[string]any{
+			"duration": time.Since(ro.Time),
+		}).Infof("%s >-< %s", ro.RemoteAddr, r.Host)
+	}()
+
+	if clientIP := xhttp.GetClientIP(r); clientIP != nil {
+		ro.ClientIP = clientIP.String()
+	}
+	ro.HTTP = &xrecorder.HTTPRecorderObject{
+		Host:   r.Host,
+		Proto:  r.Proto,
+		Scheme: "https",
+		Method: r.Method,
+		URI:    r.RequestURI,
+		Request: xrecorder.HTTPRequestRecorderObject{
+			ContentLength: r.ContentLength,
+			Header:        r.Header.Clone(),
+		},
+	}
+
+	if log.IsLevelEnabled(logger.TraceLevel) {
+		dump, _ := httputil.DumpRequest(r, false)
+		log.Trace(string(dump))
+	}
+
+	// Every stream carries its own :authority and reaches its own upstream,
+	// so each one is authorized on its own. The connection was never checked
+	// against a hostname rule.
+	if err = h.handleOptions.CheckBypass(r.Context(), h.network, normalizeHost(r.Host, "443")); err != nil {
+		log.Debug("bypass: ", r.Host)
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	if r.Body != nil {
+		r.Body = countBody(r.Body, &counters)
+	}
+
+	url := r.URL
+	url.Scheme = "https"
+	url.Host = r.Host
+	req := &http.Request{
+		Method:        r.Method,
+		URL:           url,
+		Host:          r.Host,
+		Header:        r.Header,
+		Body:          r.Body,
+		ContentLength: r.ContentLength,
+		Trailer:       r.Trailer,
+	}
+
+	var reqBody *xhttp.Body
+	if bodySize := ClampBodySize(h.recorderOptions); bodySize > 0 && req.Body != nil && ro.RecordMode != "headers" && ro.RecordMode != "off" {
+		reqBody = xhttp.NewBody(req.Body, bodySize)
+		req.Body = reqBody
+	}
+
+	resp, respErr := h.transport.RoundTrip(req.WithContext(r.Context()))
+	if reqBody != nil {
+		ro.HTTP.Request.Body = reqBody.Content()
+		ro.HTTP.Request.ContentLength = reqBody.Length()
+	}
+	err = respErr
+	if err != nil {
+		log.Error(err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	defer resp.Body.Close()
+
+	ro.HTTP.StatusCode = resp.StatusCode
+	ro.HTTP.Response.Header = resp.Header
+	ro.HTTP.Response.ContentLength = resp.ContentLength
+
+	if log.IsLevelEnabled(logger.TraceLevel) {
+		dump, _ := httputil.DumpResponse(resp, false)
+		log.Trace(string(dump))
+	}
+
+	h.setHeader(w, resp.Header)
+	w.WriteHeader(resp.StatusCode)
+
+	counted := stats_wrapper.WrapReadWriter(xio.NewReadWriter(nil, w), &counters)
+	if bodySize := ClampBodySize(h.recorderOptions); bodySize > 0 && ro.RecordMode != "headers" && ro.RecordMode != "off" {
+		respBody := xhttp.NewBody(resp.Body, bodySize)
+		resp.Body = respBody
+		io.Copy(counted, resp.Body)
+		ro.HTTP.Response.Body = respBody.Content()
+		ro.HTTP.Response.ContentLength = respBody.Length()
+	} else {
+		io.Copy(counted, resp.Body)
+	}
+}
+
+func (h *h2Handler) setHeader(w http.ResponseWriter, header http.Header) {
+	for k, v := range header {
+		for i := range v {
+			w.Header().Add(k, v[i])
+		}
+	}
+}
+
+func countBody(body io.ReadCloser, counters stats.Stats) io.ReadCloser {
+	counted := stats_wrapper.WrapReadWriter(xio.NewReadWriter(body, io.Discard), counters)
+	return xio.NewReadWriteCloser(counted, io.Discard, body)
+}

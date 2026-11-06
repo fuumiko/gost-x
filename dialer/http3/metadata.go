@@ -5,26 +5,27 @@ import (
 	"time"
 
 	mdata "github.com/go-gost/core/metadata"
+	"github.com/go-gost/x/internal/util/ech"
 	mdutil "github.com/go-gost/x/metadata/util"
 )
 
 const (
-	defaultAuthorizePath = "/authorize"
-	defaultPushPath      = "/push"
-	defaultPullPath      = "/pull"
+	defaultPushPath = "/push"
+	defaultPullPath = "/pull"
 )
 
 type metadata struct {
-	authorizePath string
-	pushPath      string
-	pullPath      string
-	host          string
+	pushPath string
+	pullPath string
+	host     string
 
 	// QUIC config options
 	keepAlivePeriod  time.Duration
 	maxIdleTimeout   time.Duration
 	handshakeTimeout time.Duration
 	maxStreams       int
+
+	ech ech.Config
 }
 
 func (d *http3Dialer) parseMetadata(md mdata.Metadata) (err error) {
@@ -36,10 +37,6 @@ func (d *http3Dialer) parseMetadata(md mdata.Metadata) (err error) {
 		maxStreams       = "maxStreams"
 	)
 
-	d.md.authorizePath = mdutil.GetString(md, "pht.authorizePath", "authorizePath")
-	if !strings.HasPrefix(d.md.authorizePath, "/") {
-		d.md.authorizePath = defaultAuthorizePath
-	}
 	d.md.pushPath = mdutil.GetString(md, "pht.pushPath", "pushPath")
 	if !strings.HasPrefix(d.md.pushPath, "/") {
 		d.md.pushPath = defaultPushPath
@@ -59,6 +56,8 @@ func (d *http3Dialer) parseMetadata(md mdata.Metadata) (err error) {
 	d.md.handshakeTimeout = mdutil.GetDuration(md, handshakeTimeout)
 	d.md.maxIdleTimeout = mdutil.GetDuration(md, maxIdleTimeout)
 	d.md.maxStreams = mdutil.GetInt(md, maxStreams)
+
+	d.md.ech = ech.FromMetadata(md)
 
 	return
 }

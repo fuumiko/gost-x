@@ -3,8 +3,11 @@ package redirect
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
 	"time"
+
+	quicdissector "github.com/go-gost/quic-dissector"
 
 	"github.com/go-gost/core/bypass"
 	"github.com/go-gost/core/handler"
@@ -15,6 +18,7 @@ import (
 	xctx "github.com/go-gost/x/ctx"
 	ictx "github.com/go-gost/x/internal/ctx"
 	xnet "github.com/go-gost/x/internal/net"
+	"github.com/go-gost/x/internal/util/sniffing"
 	rate_limiter "github.com/go-gost/x/limiter/rate"
 	xstats "github.com/go-gost/x/observer/stats"
 	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
@@ -27,9 +31,10 @@ func init() {
 }
 
 type redirectHandler struct {
-	md       metadata
-	options  handler.Options
-	recorder recorder.RecorderObject
+	md              metadata
+	options         handler.Options
+	recorder        recorder.RecorderObject
+	sessionRecorder *xrecorder.SessionRecorder
 }
 
 func NewHandler(opts ...handler.Option) handler.Handler {
@@ -54,6 +59,10 @@ func (h *redirectHandler) Init(md md.Metadata) (err error) {
 			break
 		}
 	}
+
+	h.sessionRecorder = xrecorder.NewSessionRecorder(h.recorder.Recorder, xrecorder.SessionRecorderOptions{
+		Period: h.md.recorderPeriod,
+	})
 
 	return
 }
@@ -89,6 +98,8 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 	pStats := xstats.Stats{}
 	conn = stats_wrapper.WrapConn(conn, &pStats)
 
+	session := h.sessionRecorder.NewSession(ctx, &pStats)
+
 	defer func() {
 		if err != nil {
 			ro.Err = err.Error()
@@ -96,7 +107,7 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 		ro.Duration = time.Since(start)
 		ro.InputBytes = pStats.Get(stats.KindInputBytes)
 		ro.OutputBytes = pStats.Get(stats.KindOutputBytes)
-		if err := ro.Record(ctx, h.recorder.Recorder); err != nil {
+		if err := session.Finish(ctx, *ro); err != nil {
 			log.Error("record: %v", err)
 		}
 
@@ -128,6 +139,49 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 		return xbypass.ErrBypass
 	}
 
+	var clientDgram []byte // saved for QUIC ServerHello sniff from upstream
+
+	if h.md.sniffing {
+		if h.md.sniffingTimeout > 0 {
+			conn.SetReadDeadline(time.Now().Add(h.md.sniffingTimeout))
+		}
+
+		dgram := make([]byte, 8192)
+		n, readErr := conn.Read(dgram)
+		dgram = dgram[:n]
+
+		if h.md.sniffingTimeout > 0 {
+			conn.SetReadDeadline(time.Time{})
+		}
+
+		if readErr != nil {
+			log.Debugf("udp sniff read: %v", readErr)
+			return readErr
+		}
+
+		info, sniffErr := quicdissector.SniffQUIC(dgram)
+		if sniffErr == nil {
+			clientDgram = dgram
+			sniffing.PopulateQUICClientHello(dgram, info, ro)
+
+			if info.ServerName != "" {
+				ro.Host = net.JoinHostPort(info.ServerName, "443")
+				log = log.WithFields(map[string]any{
+					"host":  ro.Host,
+					"proto": ro.Proto,
+				})
+
+				if h.options.Bypass != nil &&
+					h.options.Bypass.Contains(ctx, "udp", ro.Host, bypass.WithService(h.options.Service)) {
+					log.Debug("bypass: ", ro.Host)
+					return xbypass.ErrBypass
+				}
+			}
+		}
+
+		conn = xnet.NewReadWriteConn(io.MultiReader(bytes.NewReader(dgram), conn), conn, conn)
+	}
+
 	var buf bytes.Buffer
 	cc, err := h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &buf), dstAddr.Network(), dstAddr.String())
 	ro.Route = buf.String()
@@ -137,9 +191,36 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 	}
 	defer cc.Close()
 
+	// QUIC ServerHello sniff from upstream response.
+	if clientDgram != nil {
+		if h.md.sniffingTimeout > 0 {
+			cc.SetReadDeadline(time.Now().Add(h.md.sniffingTimeout))
+		}
+
+		sdgram := make([]byte, 8192)
+		n, readErr := cc.Read(sdgram)
+
+		if h.md.sniffingTimeout > 0 {
+			cc.SetReadDeadline(time.Time{})
+		}
+
+		if readErr != nil {
+			log.Debugf("udp server sniff read: %v", readErr)
+		}
+		if n > 0 {
+			sdgram = sdgram[:n]
+			if sh, shErr := quicdissector.SniffQUICServerHello(clientDgram, sdgram); shErr == nil {
+				sniffing.PopulateQUICServerHello(sh, ro)
+			}
+			cc = xnet.NewReadWriteConn(io.MultiReader(bytes.NewReader(sdgram), cc), cc, cc)
+		}
+	}
+
 	log = log.WithFields(map[string]any{"src": cc.LocalAddr().String(), "dst": cc.RemoteAddr().String()})
 	ro.SrcAddr = cc.LocalAddr().String()
 	ro.DstAddr = cc.RemoteAddr().String()
+
+	session.Start(*ro)
 
 	t := time.Now()
 	log.Infof("%s <-> %s", conn.RemoteAddr(), dstAddr)
@@ -163,3 +244,5 @@ func (h *redirectHandler) checkRateLimit(addr net.Addr) bool {
 
 	return true
 }
+
+func (h *redirectHandler) Close() error { return h.sessionRecorder.Close() }

@@ -1,3 +1,7 @@
+// Package cmd converts CLI command-line arguments (-L services, -F chain nodes)
+// into structured config.Config objects. It supports URL-format service and node
+// specifications, metadata query parameters, and auto-detection of handler,
+// listener, dialer, and connector types via the registry.
 package cmd
 
 import (
@@ -20,10 +24,17 @@ import (
 )
 
 var (
-	ErrInvalidCmd  = errors.New("invalid cmd")
+	// ErrInvalidCmd is returned when the command-line argument is empty.
+	ErrInvalidCmd = errors.New("invalid cmd")
+	// ErrInvalidNode is returned when a node specification cannot be parsed.
 	ErrInvalidNode = errors.New("invalid node")
 )
 
+// BuildConfigFromCmd converts CLI service (-L) and node (-F) arguments into
+// a Config. Each node becomes a hop in a single chain; each service produces
+// a ServiceConfig with auto-detected handler and listener types. Query
+// parameters in the URL are parsed as metadata and routed to the appropriate
+// config sub-struct (handler, listener, hop, connector, dialer, service).
 func BuildConfigFromCmd(serviceList, nodeList []string) (*config.Config, error) {
 	namePrefix := ""
 	cfg := &config.Config{}
@@ -157,6 +168,9 @@ func BuildConfigFromCmd(serviceList, nodeList []string) (*config.Config, error) 
 			}
 			nodeCfg := &config.NodeConfig{}
 			*nodeCfg = *nodeConfig
+			nodeCfg.Connector = copyConnectorConfig(nodeConfig.Connector)
+			nodeCfg.Dialer = copyDialerConfig(nodeConfig.Dialer)
+			nodeCfg.Metadata = copyMap(nodeConfig.Metadata)
 			nodeCfg.Name = fmt.Sprintf("%snode-%d", namePrefix, len(nodes))
 			nodeCfg.Addr = host
 			nodes = append(nodes, nodeCfg)
@@ -195,7 +209,7 @@ func BuildConfigFromCmd(serviceList, nodeList []string) (*config.Config, error) 
 	for i, service := range services {
 		service.Name = fmt.Sprintf("%sservice-%d", namePrefix, i)
 		if chain != nil {
-			if service.Listener.Type == "rtcp" || service.Listener.Type == "rudp" {
+			if service.Listener.Type == "rtcp" || service.Listener.Type == "rudp" || service.Listener.Type == "runix" {
 				service.Listener.Chain = chain.Name
 			} else {
 				service.Handler.Chain = chain.Name
@@ -335,6 +349,9 @@ func BuildConfigFromCmd(serviceList, nodeList []string) (*config.Config, error) 
 	return cfg, nil
 }
 
+// cutHost extracts the host portion from a URL string, stripping any auth
+// info (user:pass@). It returns the host and the remainder of the URL with
+// the host portion removed.
 func cutHost(s string) (host, remain string) {
 	if s == "" {
 		return
@@ -359,6 +376,10 @@ func cutHost(s string) (host, remain string) {
 	return
 }
 
+// buildServiceConfig converts a parsed service URL into one or more
+// ServiceConfig entries. Scheme components (handler+listener) are resolved
+// against the registry; path-based protocols use the URL path as the listen
+// address; a non-empty path for other protocols indicates forwarding mode.
 func buildServiceConfig(url *url.URL) ([]*config.ServiceConfig, error) {
 	namePrefix := ""
 	if v := os.Getenv("_GOST_ID"); v != "" {
@@ -376,9 +397,33 @@ func buildServiceConfig(url *url.URL) ([]*config.ServiceConfig, error) {
 		listener = schemes[1]
 	}
 
-	addrs := xnet.AddrPortRange(url.Host).Addrs()
-	if len(addrs) == 0 {
-		addrs = append(addrs, url.Host)
+	// Decide path-based from the scheme before registry remaps listener to tcp.
+	isPathBasedProtocol := listener == "unix" || listener == "runix" || listener == "serial"
+	for _, s := range schemes {
+		if s == "unix" || s == "runix" || s == "serial" {
+			isPathBasedProtocol = true
+			break
+		}
+	}
+	// A path-based protocol with an empty host (three-slash URL like
+	// unix:///var/run/sock) uses the path as the absolute listen address and
+	// has no forward target. With a non-empty host (two-slash URL like
+	// unix://sock/other.sock), the host is the listen address and any path is a
+	// forward target (port-forward to another socket), handled below.
+	isPathAddr := isPathBasedProtocol && url.Host == ""
+
+	var addrs []string
+	if isPathAddr {
+		if path := url.EscapedPath(); path != "" {
+			addrs = append(addrs, path)
+		} else {
+			addrs = append(addrs, url.Host)
+		}
+	} else {
+		addrs = xnet.AddrPortRange(url.Host).Addrs()
+		if len(addrs) == 0 {
+			addrs = append(addrs, url.Host)
+		}
 	}
 
 	var services []*config.ServiceConfig
@@ -400,7 +445,10 @@ func buildServiceConfig(url *url.URL) ([]*config.ServiceConfig, error) {
 
 	var nodes []*config.ForwardNodeConfig
 	// forward mode
-	if remotes := strings.Trim(url.EscapedPath(), "/"); remotes != "" {
+	// A path-based protocol with an empty host (e.g. unix:///abs.sock) treats
+	// the path as the listen address, not a forward target. With a host
+	// (e.g. unix://a.sock/b.sock) the path is a forward target.
+	if remotes := strings.Trim(url.EscapedPath(), "/"); remotes != "" && !isPathAddr {
 		i := 0
 		for _, addr := range strings.Split(remotes, ",") {
 			addrs := xnet.AddrPortRange(addr).Addrs()
@@ -420,12 +468,23 @@ func buildServiceConfig(url *url.URL) ([]*config.ServiceConfig, error) {
 			if listener == "tcp" || listener == "udp" ||
 				listener == "rtcp" || listener == "rudp" ||
 				listener == "tun" || listener == "tap" ||
-				listener == "dns" || listener == "unix" ||
+				listener == "dns" || listener == "unix" || listener == "runix" ||
 				listener == "serial" {
 				handler = listener
 			} else {
 				handler = "forward"
 			}
+		}
+	}
+
+	// stdio listener uses url.Host as the forwarding target.
+	if listener == "stdio" && len(nodes) == 0 && url.Host != "" {
+		nodes = append(nodes, &config.ForwardNodeConfig{
+			Name: fmt.Sprintf("%starget-0", namePrefix),
+			Addr: url.Host,
+		})
+		if handler == "auto" {
+			handler = "tcp"
 		}
 	}
 
@@ -453,10 +512,15 @@ func buildServiceConfig(url *url.URL) ([]*config.ServiceConfig, error) {
 
 	var auth *config.AuthConfig
 	if url.User != nil {
-		auth = &config.AuthConfig{
-			Username: url.User.Username(),
+		if strings.HasPrefix(url.Scheme, "ss") {
+			auth = decodeSIP002Auth(url)
 		}
-		auth.Password, _ = url.User.Password()
+		if auth == nil {
+			auth = &config.AuthConfig{
+				Username: url.User.Username(),
+			}
+			auth.Password, _ = url.User.Password()
+		}
 	}
 
 	m := map[string]any{}
@@ -467,7 +531,7 @@ func buildServiceConfig(url *url.URL) ([]*config.ServiceConfig, error) {
 	}
 	md := mdx.NewMetadata(m)
 
-	if sa := mdutil.GetString(md, "auth"); sa != "" {
+	if sa := mdutil.GetString(md, "auth"); sa != "" && auth == nil {
 		au, err := parseAuthFromCmd(sa)
 		if err != nil {
 			return nil, err
@@ -564,14 +628,17 @@ func buildServiceConfig(url *url.URL) ([]*config.ServiceConfig, error) {
 		if svc.Forwarder != nil {
 			svc.Forwarder.Selector = selector
 		}
-		svc.Handler = handlerCfg
-		svc.Listener = listenerCfg
-		svc.Metadata = serviceMd
+		svc.Handler = copyHandlerConfig(handlerCfg)
+		svc.Listener = copyListenerConfig(listenerCfg)
+		svc.Metadata = copyMap(serviceMd)
 	}
 
 	return services, nil
 }
 
+// buildNodeConfig converts a parsed node URL into a NodeConfig. Scheme
+// components (connector+dialer) are resolved against the registry; path-based
+// dialers use the URL path as the node address.
 func buildNodeConfig(url *url.URL, m map[string]any) (*config.NodeConfig, error) {
 	var connector, dialer string
 	schemes := strings.Split(url.Scheme, "+")
@@ -582,6 +649,18 @@ func buildNodeConfig(url *url.URL, m map[string]any) (*config.NodeConfig, error)
 	if len(schemes) == 2 {
 		connector = schemes[0]
 		dialer = schemes[1]
+	}
+
+	// Path-based address logic must use the requested scheme, not the
+	// registry fallback (unix/serial often remap to http/tcp when only
+	// the CLI registry is partially populated, or in unit tests).
+	isPathBasedProtocol := dialer == "unix" || dialer == "serial" ||
+		connector == "unix" || connector == "serial"
+	for _, s := range schemes {
+		if s == "unix" || s == "serial" || s == "runix" {
+			isPathBasedProtocol = true
+			break
+		}
 	}
 
 	md := mdx.NewMetadata(m)
@@ -598,10 +677,15 @@ func buildNodeConfig(url *url.URL, m map[string]any) (*config.NodeConfig, error)
 
 	var auth *config.AuthConfig
 	if url.User != nil {
-		auth = &config.AuthConfig{
-			Username: url.User.Username(),
+		if strings.HasPrefix(url.Scheme, "ss") {
+			auth = decodeSIP002Auth(url)
 		}
-		auth.Password, _ = url.User.Password()
+		if auth == nil {
+			auth = &config.AuthConfig{
+				Username: url.User.Username(),
+			}
+			auth.Password, _ = url.User.Password()
+		}
 	}
 
 	if sauth := mdutil.GetString(md, "auth"); sauth != "" && auth == nil {
@@ -664,8 +748,20 @@ func buildNodeConfig(url *url.URL, m map[string]any) (*config.NodeConfig, error)
 		nodeMd[k] = v
 	}
 
+	// For path-based protocols (Unix socket dialers and serial), use path as address.
+	// Three-slash URLs (empty host) give the absolute socket path; two-slash URLs
+	// use the host as the socket. The path on a host form is not part of the node
+	// address (it is a forward target for services, ignored for nodes).
+	var nodeAddr string
+	if isPathBasedProtocol && url.Host == "" {
+		// Three slashes: path is absolute (keep leading slash)
+		nodeAddr = url.EscapedPath()
+	} else {
+		nodeAddr = url.Host
+	}
+
 	node := &config.NodeConfig{
-		Addr:     url.Host,
+		Addr:     nodeAddr,
 		Metadata: nodeMd,
 	}
 	node.Connector = &config.ConnectorConfig{
@@ -687,6 +783,9 @@ func buildNodeConfig(url *url.URL, m map[string]any) (*config.NodeConfig, error)
 	return node, nil
 }
 
+// Norm normalizes a raw command-line string into a parsed URL. Missing schemes
+// default to "auto" and "https" is rewritten to "http+tls". An empty string
+// returns ErrInvalidCmd.
 func Norm(s string) (*url.URL, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -708,10 +807,51 @@ func Norm(s string) (*url.URL, error) {
 	return url, nil
 }
 
-func parseAuthFromCmd(sa string) (*config.AuthConfig, error) {
-	v, err := base64.StdEncoding.DecodeString(sa)
+// decodeSIP002Auth attempts to decode a Shadowsocks SIP002-style URL where
+// the userinfo is a single base64-encoded "method:password" string with no
+// separate password field. Returns nil if the URL does not use this format.
+func decodeSIP002Auth(u *url.URL) *config.AuthConfig {
+	if u.User == nil {
+		return nil
+	}
+	_, hasPassword := u.User.Password()
+	if hasPassword {
+		return nil
+	}
+	username := u.User.Username()
+	if username == "" {
+		return nil
+	}
+
+	decoded, err := base64.RawURLEncoding.DecodeString(username)
 	if err != nil {
-		return nil, err
+		decoded, err = base64.StdEncoding.DecodeString(username)
+		if err != nil {
+			return nil
+		}
+	}
+
+	cs := string(decoded)
+	n := strings.IndexByte(cs, ':')
+	if n < 0 {
+		return nil
+	}
+
+	return &config.AuthConfig{
+		Username: cs[:n],
+		Password: cs[n+1:],
+	}
+}
+
+// parseAuthFromCmd decodes a base64-encoded "username:password" string from
+// a query parameter into an AuthConfig. The password portion is optional.
+func parseAuthFromCmd(sa string) (*config.AuthConfig, error) {
+	v, err := base64.RawURLEncoding.DecodeString(sa)
+	if err != nil {
+		v, err = base64.StdEncoding.DecodeString(sa)
+		if err != nil {
+			return nil, err
+		}
 	}
 	cs := string(v)
 	n := strings.IndexByte(cs, ':')
@@ -727,12 +867,17 @@ func parseAuthFromCmd(sa string) (*config.AuthConfig, error) {
 	}, nil
 }
 
+// parseSelector extracts selector configuration (strategy, maxFails,
+// failTimeout, maxParallel, parallelMode) from metadata and removes the
+// consumed keys. Returns nil if no selector parameters are present.
 func parseSelector(m map[string]any) *config.SelectorConfig {
 	md := mdx.NewMetadata(m)
 	strategy := mdutil.GetString(md, "strategy")
 	maxFails := mdutil.GetInt(md, "maxFails", "max_fails")
 	failTimeout := mdutil.GetDuration(md, "failTimeout", "fail_timeout")
-	if strategy == "" && maxFails <= 0 && failTimeout <= 0 {
+	maxParallel := mdutil.GetInt(md, "maxParallel", "max_parallel")
+	parallelMode := mdutil.GetString(md, "parallelMode", "parallel_mode")
+	if strategy == "" && maxFails <= 0 && failTimeout <= 0 && maxParallel <= 0 && parallelMode == "" {
 		return nil
 	}
 	if strategy == "" {
@@ -750,10 +895,87 @@ func parseSelector(m map[string]any) *config.SelectorConfig {
 	delete(m, "max_fails")
 	delete(m, "failTimeout")
 	delete(m, "fail_timeout")
+	delete(m, "maxParallel")
+	delete(m, "max_parallel")
+	delete(m, "parallelMode")
+	delete(m, "parallel_mode")
 
 	return &config.SelectorConfig{
-		Strategy:    strategy,
-		MaxFails:    maxFails,
-		FailTimeout: failTimeout,
+		Strategy:     strategy,
+		MaxFails:     maxFails,
+		FailTimeout:  failTimeout,
+		MaxParallel:  maxParallel,
+		ParallelMode: parallelMode,
 	}
+}
+
+func copyMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	c := make(map[string]any, len(m))
+	for k, v := range m {
+		c[k] = v
+	}
+	return c
+}
+
+func copyAuth(cfg *config.AuthConfig) *config.AuthConfig {
+	if cfg == nil {
+		return nil
+	}
+	c := *cfg
+	return &c
+}
+
+func copyTLS(cfg *config.TLSConfig) *config.TLSConfig {
+	if cfg == nil {
+		return nil
+	}
+	c := *cfg
+	return &c
+}
+
+func copyConnectorConfig(cfg *config.ConnectorConfig) *config.ConnectorConfig {
+	if cfg == nil {
+		return nil
+	}
+	c := *cfg
+	c.Auth = copyAuth(cfg.Auth)
+	c.TLS = copyTLS(cfg.TLS)
+	c.Metadata = copyMap(cfg.Metadata)
+	return &c
+}
+
+func copyDialerConfig(cfg *config.DialerConfig) *config.DialerConfig {
+	if cfg == nil {
+		return nil
+	}
+	c := *cfg
+	c.Auth = copyAuth(cfg.Auth)
+	c.TLS = copyTLS(cfg.TLS)
+	c.Metadata = copyMap(cfg.Metadata)
+	return &c
+}
+
+func copyHandlerConfig(cfg *config.HandlerConfig) *config.HandlerConfig {
+	if cfg == nil {
+		return nil
+	}
+	c := *cfg
+	c.Auth = copyAuth(cfg.Auth)
+	c.TLS = copyTLS(cfg.TLS)
+	c.Metadata = copyMap(cfg.Metadata)
+	return &c
+}
+
+func copyListenerConfig(cfg *config.ListenerConfig) *config.ListenerConfig {
+	if cfg == nil {
+		return nil
+	}
+	c := *cfg
+	c.Auth = copyAuth(cfg.Auth)
+	c.TLS = copyTLS(cfg.TLS)
+	c.Metadata = copyMap(cfg.Metadata)
+	return &c
 }

@@ -82,7 +82,10 @@ func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, networ
 	ro.SrcAddr = cc.LocalAddr().String()
 	ro.DstAddr = cc.RemoteAddr().String()
 
-	resp := gosocks5.NewReply(gosocks5.Succeeded, nil)
+	// Report the actual bound address (BND.ADDR) per RFC 1928 §6.
+	bndAddr := gosocks5.Addr{}
+	bndAddr.ParseFrom(cc.LocalAddr().String())
+	resp := gosocks5.NewReply(gosocks5.Succeeded, &bndAddr)
 	log.Trace(resp)
 	if err := resp.Write(conn); err != nil {
 		log.Error(err)
@@ -112,6 +115,7 @@ func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, networ
 			Websocket:           h.md.sniffingWebsocket,
 			WebsocketSampleRate: h.md.sniffingWebsocketSampleRate,
 			Recorder:            h.recorder.Recorder,
+			SessionRecorder:     h.sessionRecorder,
 			RecorderOptions:     h.recorder.Options,
 			Certificate:         h.md.certificate,
 			PrivateKey:          h.md.privateKey,
@@ -128,6 +132,7 @@ func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, networ
 				sniffing.WithService(h.options.Service),
 				sniffing.WithDial(dial),
 				sniffing.WithDialTLS(dialTLS),
+				sniffing.WithBypass(h.options.Bypass),
 				sniffing.WithRecorderObject(ro),
 				sniffing.WithLog(log),
 			)
@@ -136,11 +141,14 @@ func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, networ
 				sniffing.WithService(h.options.Service),
 				sniffing.WithDial(dial),
 				sniffing.WithDialTLS(dialTLS),
+				sniffing.WithBypass(h.options.Bypass),
 				sniffing.WithRecorderObject(ro),
 				sniffing.WithLog(log),
 			)
 		}
 	}
+
+	ictx.SessionFromContext(ctx).Start(*ro)
 
 	t := time.Now()
 	log.Infof("%s <-> %s", conn.RemoteAddr(), address)

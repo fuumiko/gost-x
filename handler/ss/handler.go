@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/go-gost/core/bypass"
@@ -14,11 +16,13 @@ import (
 	"github.com/go-gost/core/observer/stats"
 	"github.com/go-gost/core/recorder"
 	"github.com/go-gost/go-shadowsocks2/core"
+	"github.com/go-gost/go-shadowsocks2/socks"
 	"github.com/go-gost/go-shadowsocks2/utils"
 	xctx "github.com/go-gost/x/ctx"
 	ictx "github.com/go-gost/x/internal/ctx"
 	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/util/sniffing"
+	"github.com/go-gost/x/internal/util/ss/none"
 	tls_util "github.com/go-gost/x/internal/util/tls"
 	rate_limiter "github.com/go-gost/x/limiter/rate"
 	xstats "github.com/go-gost/x/observer/stats"
@@ -54,10 +58,21 @@ func (h *ssHandler) Init(md md.Metadata) (err error) {
 	if err = h.parseMetadata(md); err != nil {
 		return
 	}
-	if h.options.Auth != nil {
-		method := h.options.Auth.Username()
-		password, _ := h.options.Auth.Password()
 
+	if h.options.Auth == nil {
+		return errors.New("ss: auth is required")
+	}
+
+	method := h.options.Auth.Username()
+	password, _ := h.options.Auth.Password()
+
+	if strings.EqualFold(method, "none") || strings.EqualFold(method, "dummy") {
+		h.server = core.NewTCPServer(core.ServerConfig{Cipher: none.Cipher, Users: h.md.users})
+		err = h.server.Init()
+		if err != nil {
+			return err
+		}
+	} else {
 		serverConfig, err := utils.NewServerConfig(method, password, h.md.users)
 		if err != nil {
 			return err
@@ -139,7 +154,13 @@ func (h *ssHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.H
 	if err != nil {
 		return
 	}
-	target := wrappedConn.Target()
+	var target socks.Addr
+	if tc, ok := wrappedConn.(interface{ Target() socks.Addr }); ok {
+		target = tc.Target()
+	}
+	if len(target) == 0 {
+		return errors.New("ss: target not available")
+	}
 	conn = wrappedConn
 
 	conn.SetReadDeadline(time.Now().Add(h.md.readTimeout))
@@ -212,18 +233,22 @@ func (h *ssHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.H
 		conn = xnet.NewReadWriteConn(br, conn, conn)
 		switch proto {
 		case sniffing.ProtoHTTP:
+			ro.Time = time.Time{}
 			return sniffer.HandleHTTP(ctx, "tcp", conn,
 				sniffing.WithService(h.options.Service),
 				sniffing.WithDial(dial),
 				sniffing.WithDialTLS(dialTLS),
+				sniffing.WithBypass(h.options.Bypass),
 				sniffing.WithRecorderObject(ro),
 				sniffing.WithLog(log),
 			)
 		case sniffing.ProtoTLS:
+			ro.Time = time.Time{}
 			return sniffer.HandleTLS(ctx, "tcp", conn,
 				sniffing.WithService(h.options.Service),
 				sniffing.WithDial(dial),
 				sniffing.WithDialTLS(dialTLS),
+				sniffing.WithBypass(h.options.Bypass),
 				sniffing.WithRecorderObject(ro),
 				sniffing.WithLog(log),
 			)

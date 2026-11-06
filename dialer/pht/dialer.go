@@ -56,7 +56,10 @@ func (d *phtDialer) Init(md md.Metadata) (err error) {
 		return
 	}
 
-	return nil
+	if !d.tlsEnabled {
+		return nil
+	}
+	return d.md.ech.Init(d.options.Logger, d.options.TLSConfig)
 }
 
 // Multiplex implements dialer.Multiplexer interface.
@@ -96,7 +99,15 @@ func (d *phtDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialOp
 			ExpectContinueTimeout: 1 * time.Second,
 		}
 		if d.tlsEnabled {
-			tr.TLSClientConfig = d.options.TLSConfig
+			serverName := host
+			if d.options.TLSConfig != nil && d.options.TLSConfig.ServerName != "" {
+				serverName = d.options.TLSConfig.ServerName
+			}
+			tlsCfg, err := d.md.ech.Apply(ctx, d.options.TLSConfig, serverName)
+			if err != nil {
+				return nil, err
+			}
+			tr.TLSClientConfig = tlsCfg
 		}
 
 		client = &pht_util.Client{
@@ -105,14 +116,29 @@ func (d *phtDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialOp
 				// Timeout:   60 * time.Second,
 				Transport: tr,
 			},
-			AuthorizePath: d.md.authorizePath,
-			PushPath:      d.md.pushPath,
-			PullPath:      d.md.pullPath,
-			TLSEnabled:    d.tlsEnabled,
-			Logger:        d.options.Logger,
+			PushPath:   d.md.pushPath,
+			PullPath:   d.md.pullPath,
+			TLSEnabled: d.tlsEnabled,
+			Header:     d.md.header,
+			Logger:     d.options.Logger,
 		}
 		d.clients[addr] = client
 	}
 
-	return client.Dial(ctx, addr)
+	ret, err := client.Dial(ctx, addr)
+	if err != nil {
+		sn := addr
+		if h, _, err2 := net.SplitHostPort(addr); err2 == nil {
+			sn = h
+		}
+		if d.options.TLSConfig != nil && d.options.TLSConfig.ServerName != "" {
+			sn = d.options.TLSConfig.ServerName
+		}
+		if rerr := d.md.ech.OnDialError(ctx, err, sn); rerr != nil {
+			delete(d.clients, addr)
+			return nil, rerr
+		}
+		return nil, err
+	}
+	return ret, nil
 }

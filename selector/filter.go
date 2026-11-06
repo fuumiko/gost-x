@@ -28,78 +28,50 @@ func (f *failFilter[T]) Filter(ctx context.Context, vs ...T) []T {
 	if len(vs) <= 1 {
 		return vs
 	}
-
-	for i, v := range vs {
-		maxFails := f.maxFails
-		failTimeout := f.failTimeout
-		if mi, _ := any(v).(metadata.Metadatable); mi != nil {
-			if md := mi.Metadata(); md != nil {
-				if md.IsExists(labelMaxFails) {
-					maxFails = mdutil.GetInt(md, labelMaxFails)
-				}
-				if md.IsExists(labelFailTimeout) {
-					failTimeout = mdutil.GetDuration(md, labelFailTimeout)
-				}
-			}
-		}
-		if maxFails <= 0 {
-			maxFails = 1
-		}
-		if failTimeout <= 0 {
-			failTimeout = DefaultFailTimeout
-		}
-
-		dead := false
-		if mi, _ := any(v).(selector.Markable); mi != nil {
-			if marker := mi.Marker(); marker != nil {
-				if marker.Count() >= int64(maxFails) &&
-					time.Since(marker.Time()) < failTimeout {
-					dead = true
-				}
-			}
-		}
-
-		if dead {
-			l := make([]T, 0, len(vs)-1)
-			l = append(l, vs[:i]...)
-			for _, v := range vs[i+1:] {
-				maxFails := f.maxFails
-				failTimeout := f.failTimeout
-				if mi, _ := any(v).(metadata.Metadatable); mi != nil {
-					if md := mi.Metadata(); md != nil {
-						if md.IsExists(labelMaxFails) {
-							maxFails = mdutil.GetInt(md, labelMaxFails)
-						}
-						if md.IsExists(labelFailTimeout) {
-							failTimeout = mdutil.GetDuration(md, labelFailTimeout)
-						}
-					}
-				}
-				if maxFails <= 0 {
-					maxFails = 1
-				}
-				if failTimeout <= 0 {
-					failTimeout = DefaultFailTimeout
-				}
-
-				healthy := true
-				if mi, _ := any(v).(selector.Markable); mi != nil {
-					if marker := mi.Marker(); marker != nil {
-						if marker.Count() >= int64(maxFails) &&
-							time.Since(marker.Time()) < failTimeout {
-							healthy = false
-						}
-					}
-				}
-				if healthy {
-					l = append(l, v)
-				}
-			}
-			return l
+	var l []T
+	for _, v := range vs {
+		if !IsFailed(v, f.maxFails, f.failTimeout) {
+			l = append(l, v)
 		}
 	}
+	return l
+}
 
-	return vs
+// IsFailed reports whether v is currently marked failed: its failure count
+// has reached maxFails and the last failure is still within failTimeout.
+// Per-item metadata keys "maxFails" and "failTimeout" override the given
+// defaults. Items without a failure marker are never considered failed.
+func IsFailed[T any](v T, maxFails int, failTimeout time.Duration) bool {
+	maxFails, failTimeout = effectiveFailSettings(v, maxFails, failTimeout)
+
+	mi, _ := any(v).(selector.Markable)
+	if mi == nil || mi.Marker() == nil {
+		return false
+	}
+	marker := mi.Marker()
+	return !(marker.Count() < int64(maxFails) || time.Since(marker.Time()) >= failTimeout)
+}
+
+// effectiveFailSettings resolves the maxFails/failTimeout for v, honoring
+// per-item metadata overrides and defaulting to 1 / DefaultFailTimeout.
+func effectiveFailSettings[T any](v T, maxFails int, failTimeout time.Duration) (int, time.Duration) {
+	if mi, _ := any(v).(metadata.Metadatable); mi != nil {
+		if md := mi.Metadata(); md != nil {
+			if md.IsExists(labelMaxFails) {
+				maxFails = mdutil.GetInt(md, labelMaxFails)
+			}
+			if md.IsExists(labelFailTimeout) {
+				failTimeout = mdutil.GetDuration(md, labelFailTimeout)
+			}
+		}
+	}
+	if maxFails <= 0 {
+		maxFails = 1
+	}
+	if failTimeout <= 0 {
+		failTimeout = DefaultFailTimeout
+	}
+	return maxFails, failTimeout
 }
 
 type backupFilter[T any] struct{}

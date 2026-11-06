@@ -13,12 +13,19 @@ import (
 )
 
 type metadata struct {
+	recorderPeriod time.Duration // reports a live session on this interval; 0 = one record per session, written when it ends.
+	// readTimeout is passed to SnifferBuilder as the timeout for reading
+	// upstream response headers during HTTP/TLS sniffing. It is NOT used
+	// as a deadline on the initial client connection (unlike socks/ss
+	// handlers), because redirect/tcp has no protocol handshake.
+	// 0 or negative defaults to 15s.
 	readTimeout time.Duration
 	tproxy      bool
 
 	sniffing                    bool
 	sniffingTimeout             time.Duration
 	sniffingFallback            bool
+	sniffingDialOriginalDst     bool
 	sniffingWebsocket           bool
 	sniffingWebsocketSampleRate float64
 
@@ -29,6 +36,8 @@ type metadata struct {
 }
 
 func (h *redirectHandler) parseMetadata(md mdata.Metadata) (err error) {
+	h.md.recorderPeriod = mdutil.GetDuration(md, "recorder.period", "recorder.reportPeriod")
+
 	h.md.readTimeout = mdutil.GetDuration(md, "readTimeout")
 	if h.md.readTimeout <= 0 {
 		h.md.readTimeout = 15 * time.Second
@@ -38,6 +47,7 @@ func (h *redirectHandler) parseMetadata(md mdata.Metadata) (err error) {
 	h.md.sniffing = mdutil.GetBool(md, "sniffing")
 	h.md.sniffingTimeout = mdutil.GetDuration(md, "sniffing.timeout")
 	h.md.sniffingFallback = mdutil.GetBool(md, "sniffing.fallback")
+	h.md.sniffingDialOriginalDst = mdutil.GetBool(md, "sniffing.dialOriginalDst")
 	h.md.sniffingWebsocket = mdutil.GetBool(md, "sniffing.websocket")
 	h.md.sniffingWebsocketSampleRate = mdutil.GetFloat(md, "sniffing.websocket.sampleRate")
 

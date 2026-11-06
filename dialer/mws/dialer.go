@@ -2,7 +2,6 @@ package mws
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/url"
 	"sync"
@@ -12,6 +11,7 @@ import (
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
 	xctx "github.com/go-gost/x/ctx"
+	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/net/proxyproto"
 	"github.com/go-gost/x/internal/util/mux"
 	ws_util "github.com/go-gost/x/internal/util/ws"
@@ -61,7 +61,10 @@ func (d *mwsDialer) Init(md md.Metadata) (err error) {
 		return
 	}
 
-	return nil
+	if !d.tlsEnabled {
+		return nil
+	}
+	return d.md.ech.Init(d.options.Logger, d.options.TLSConfig)
 }
 
 // Multiplex implements dialer.Multiplexer interface.
@@ -75,7 +78,17 @@ func (d *mwsDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialOp
 
 	session, ok := d.sessions[addr]
 	if session != nil && session.IsClosed() {
-		delete(d.sessions, addr) // session is dead
+		// A session still waiting for its handshake is not dead: its conn
+		// belongs to the request that dialed it, whose Handshake either
+		// builds the session on it or closes it. Only an established
+		// session's base conn is closed here.
+		if session.session != nil {
+			session.Close()
+			if session.conn != nil {
+				session.conn.Close() // base conn would otherwise leak (and hold a p2p tunnel open)
+			}
+		}
+		delete(d.sessions, addr)
 		ok = false
 	}
 	if !ok {
@@ -87,6 +100,15 @@ func (d *mwsDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialOp
 		conn, err = options.Dialer.Dial(ctx, "tcp", addr)
 		if err != nil {
 			return
+		}
+
+		if d.md.tcpKeepalive {
+			xnet.ApplyKeepalive(conn, net.KeepAliveConfig{
+				Enable:   true,
+				Idle:     d.md.tcpKeepaliveIdle,
+				Interval: d.md.tcpKeepaliveInterval,
+				Count:    d.md.tcpKeepaliveCount,
+			})
 		}
 
 		conn = proxyproto.WrapClientConn(
@@ -119,10 +141,15 @@ func (d *mwsDialer) Handshake(ctx context.Context, conn net.Conn, options ...dia
 
 	session, ok := d.sessions[opts.Addr]
 	if session != nil && session.conn != conn {
-		err := errors.New("mws: unrecognized connection")
-		log.Error(err)
-		conn.Close()
-		return nil, err
+		// Another Dial registered a conn of its own while this one waited
+		// for the lock. If it has become a live session, use that and drop
+		// this conn; otherwise build the session on this conn, and the other
+		// request's Handshake will find it here and use it.
+		if session.IsClosed() {
+			ok = false
+		} else {
+			conn.Close()
+		}
 	}
 
 	if !ok || session.session == nil {
@@ -130,7 +157,7 @@ func (d *mwsDialer) Handshake(ctx context.Context, conn net.Conn, options ...dia
 		if host == "" {
 			host = opts.Addr
 		}
-		s, err := d.initSession(ctx, host, conn, log)
+		s, err := d.initSession(ctx, host, conn, log, opts.Addr)
 		if err != nil {
 			log.Error(err)
 			conn.Close()
@@ -151,7 +178,7 @@ func (d *mwsDialer) Handshake(ctx context.Context, conn net.Conn, options ...dia
 	return cc, nil
 }
 
-func (d *mwsDialer) initSession(ctx context.Context, host string, conn net.Conn, log logger.Logger) (*muxSession, error) {
+func (d *mwsDialer) initSession(ctx context.Context, host string, conn net.Conn, log logger.Logger, optAddr string) (*muxSession, error) {
 	dialer := websocket.Dialer{
 		HandshakeTimeout:  d.md.handshakeTimeout,
 		ReadBufferSize:    d.md.readBufferSize,
@@ -165,7 +192,15 @@ func (d *mwsDialer) initSession(ctx context.Context, host string, conn net.Conn,
 	url := url.URL{Scheme: "ws", Host: host, Path: d.md.path}
 	if d.tlsEnabled {
 		url.Scheme = "wss"
-		dialer.TLSClientConfig = d.options.TLSConfig
+		serverName := ""
+		if d.options.TLSConfig != nil {
+			serverName = d.options.TLSConfig.ServerName
+		}
+		cfg, err := d.md.ech.Apply(ctx, d.options.TLSConfig, serverName)
+		if err != nil {
+			return nil, err
+		}
+		dialer.TLSClientConfig = cfg
 	}
 
 	if d.md.handshakeTimeout > 0 {
@@ -174,6 +209,15 @@ func (d *mwsDialer) initSession(ctx context.Context, host string, conn net.Conn,
 
 	c, resp, err := dialer.DialContext(ctx, url.String(), d.md.header)
 	if err != nil {
+		if d.tlsEnabled {
+			serverName := ""
+			if d.options.TLSConfig != nil {
+				serverName = d.options.TLSConfig.ServerName
+			}
+			if rerr := d.md.ech.OnRejection(err, serverName); rerr != nil {
+				return nil, rerr
+			}
+		}
 		return nil, err
 	}
 	resp.Body.Close()
@@ -191,7 +235,7 @@ func (d *mwsDialer) initSession(ctx context.Context, host string, conn net.Conn,
 			c.SetReadDeadline(time.Now().Add(d.md.keepaliveInterval * 2))
 			return nil
 		})
-		go d.keepAlive(cc)
+		go d.keepAlive(cc, optAddr)
 	}
 
 	// stream multiplex
@@ -203,7 +247,7 @@ func (d *mwsDialer) initSession(ctx context.Context, host string, conn net.Conn,
 	return &muxSession{conn: cc, session: session}, nil
 }
 
-func (d *mwsDialer) keepAlive(conn ws_util.WebsocketConn) {
+func (d *mwsDialer) keepAlive(conn ws_util.WebsocketConn, optAddr string) {
 	ticker := time.NewTicker(d.md.keepaliveInterval)
 	defer ticker.Stop()
 
@@ -211,6 +255,11 @@ func (d *mwsDialer) keepAlive(conn ws_util.WebsocketConn) {
 		d.options.Logger.Debug("send ping")
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+
+			d.sessionMutex.Lock()
+			delete(d.sessions, optAddr)
+			d.sessionMutex.Unlock()
+			conn.Close()
 			return
 		}
 		conn.SetWriteDeadline(time.Time{})

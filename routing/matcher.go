@@ -6,8 +6,11 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/tidwall/gjson"
 
 	"github.com/go-gost/core/routing"
 	"github.com/go-gost/x/registry"
@@ -38,6 +41,10 @@ type matcher struct {
 	tree matchersTree
 }
 
+// NewMatcher parses a routing rule string and returns a routing.Matcher.
+// The rule syntax supports boolean expressions with matchers like
+// Host(`example.com`), Path(`/api`), Method(`GET`), etc., combined
+// with &&, ||, and ! operators.
 func NewMatcher(rule string) (routing.Matcher, error) {
 	parse, err := defaultParser.Parse(rule)
 	if err != nil {
@@ -140,6 +147,7 @@ func (m *matchersTree) addRule(rule *rules.Tree, funcs matcherFuncs) error {
 
 var httpFuncs = map[string]func(*matchersTree, ...string) error{
 	"ClientIP":     expectNParameters(clientIP, 1),
+	"Network":      expectNParameters(network, 1),
 	"Proto":        expectNParameters(proto, 1),
 	"Host":         expectNParameters(host, 1),
 	"HostRegexp":   expectNParameters(hostRegexp, 1),
@@ -147,10 +155,12 @@ var httpFuncs = map[string]func(*matchersTree, ...string) error{
 	"Path":         expectNParameters(path, 1),
 	"PathRegexp":   expectNParameters(pathRegexp, 1),
 	"PathPrefix":   expectNParameters(pathPrefix, 1),
-	"Header":       expectNParameters(header, 1, 2),
+	"Header":       expectNParameters(header, 1, 2, 3),
 	"HeaderRegexp": expectNParameters(headerRegexp, 1, 2),
-	"Query":        expectNParameters(query, 1, 2),
+	"Query":        expectNParameters(query, 1, 2, 3),
 	"QueryRegexp":  expectNParameters(queryRegexp, 1, 2),
+	"BodyJSON":     expectNParameters(bodyJSON, 2, 3),
+	"BodyRegexp":   expectNParameters(bodyRegexp, 1),
 	"Bypass":       expectNParameters(bypass, 1),
 	"Admission":    expectNParameters(admission, 1),
 }
@@ -202,6 +212,18 @@ func proto(tree *matchersTree, protos ...string) error {
 	return nil
 }
 
+func network(tree *matchersTree, networks ...string) error {
+	network := strings.ToLower(networks[0])
+
+	tree.matcher = func(req *routing.Request) bool {
+		// Use prefix match so Network("tcp") matches "tcp", "tcp4", "tcp6"
+		// and Network("udp") matches "udp", "udp4", "udp6".
+		return strings.HasPrefix(req.Network, network)
+	}
+
+	return nil
+}
+
 func method(tree *matchersTree, methods ...string) error {
 	method := strings.ToUpper(methods[0])
 
@@ -239,7 +261,7 @@ func host(tree *matchersTree, hosts ...string) error {
 			return true
 		}
 
-		if host[0] == '.' && strings.HasSuffix(reqHost, host[1:]) {
+		if host[0] == '.' && strings.HasSuffix(reqHost, host) {
 			return true
 		}
 
@@ -288,7 +310,7 @@ func pathRegexp(tree *matchersTree, paths ...string) error {
 
 	re, err := regexp.Compile(path)
 	if err != nil {
-		return fmt.Errorf("compiling PathPrefix matcher: %w", err)
+		return fmt.Errorf("compiling PathRegexp matcher: %w", err)
 	}
 
 	tree.matcher = func(req *routing.Request) bool {
@@ -315,9 +337,32 @@ func pathPrefix(tree *matchersTree, paths ...string) error {
 func header(tree *matchersTree, headers ...string) error {
 	key := http.CanonicalHeaderKey(headers[0])
 
+	op, compVal, err := parseCompareParams(headers)
+	if err != nil {
+		return err
+	}
+	if op != "" {
+		tree.matcher = func(req *routing.Request) bool {
+			if req.Header == nil {
+				return false
+			}
+			for _, v := range req.Header[key] {
+				f, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					continue
+				}
+				if compareOp(f, compVal, op) {
+					return true
+				}
+			}
+			return false
+		}
+		return nil
+	}
+
 	var value string
 	var hasValue bool
-	if len(headers) == 2 {
+	if len(headers) >= 2 {
 		value = headers[1]
 		hasValue = true
 	}
@@ -380,9 +425,32 @@ func headerRegexp(tree *matchersTree, headers ...string) error {
 func query(tree *matchersTree, queries ...string) error {
 	key := queries[0]
 
+	op, compVal, err := parseCompareParams(queries)
+	if err != nil {
+		return err
+	}
+	if op != "" {
+		tree.matcher = func(req *routing.Request) bool {
+			if req.Query == nil {
+				return false
+			}
+			for _, v := range req.Query[key] {
+				f, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					continue
+				}
+				if compareOp(f, compVal, op) {
+					return true
+				}
+			}
+			return false
+		}
+		return nil
+	}
+
 	var value string
 	var hasValue bool
-	if len(queries) == 2 {
+	if len(queries) >= 2 {
 		value = queries[1]
 		hasValue = true
 	}
@@ -439,6 +507,94 @@ func queryRegexp(tree *matchersTree, queries ...string) error {
 	return nil
 }
 
+func bodyRegexp(tree *matchersTree, patterns ...string) error {
+	re, err := regexp.Compile(patterns[0])
+	if err != nil {
+		return fmt.Errorf("compiling BodyRegexp matcher: %w", err)
+	}
+
+	tree.matcher = func(req *routing.Request) bool {
+		if len(req.Body) == 0 {
+			return false
+		}
+		return re.Match(req.Body)
+	}
+
+	return nil
+}
+
+func compareOp(f, compVal float64, op string) bool {
+	switch op {
+	case "gt":
+		return f > compVal
+	case "ge":
+		return f >= compVal
+	case "lt":
+		return f < compVal
+	case "le":
+		return f <= compVal
+	case "eq":
+		return f == compVal
+	case "ne":
+		return f != compVal
+	}
+	return false
+}
+
+func parseCompareParams(args []string) (op string, compVal float64, err error) {
+	if len(args) < 3 {
+		return
+	}
+	op = args[1]
+	switch op {
+	case "gt", "ge", "lt", "le", "eq", "ne":
+	default:
+		return "", 0, fmt.Errorf("unknown comparison operator %q", op)
+	}
+	v, err := strconv.ParseFloat(args[2], 64)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid compare value %q: %w", args[2], err)
+	}
+	return op, v, nil
+}
+
+func bodyJSON(tree *matchersTree, args ...string) error {
+	path := args[0]
+
+	op, compVal, err := parseCompareParams(args)
+	if err != nil {
+		return err
+	}
+	if op != "" {
+		tree.matcher = func(req *routing.Request) bool {
+			if len(req.Body) == 0 {
+				return false
+			}
+			f, err := strconv.ParseFloat(gjson.GetBytes(req.Body, path).String(), 64)
+			if err != nil {
+				return false
+			}
+			return compareOp(f, compVal, op)
+		}
+		return nil
+	}
+
+	pattern := args[1]
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return fmt.Errorf("compiling BodyJSON pattern: %w", err)
+	}
+
+	tree.matcher = func(req *routing.Request) bool {
+		if len(req.Body) == 0 {
+			return false
+		}
+		return re.MatchString(gjson.GetBytes(req.Body, path).String())
+	}
+
+	return nil
+}
+
 func admission(tree *matchersTree, names ...string) error {
 	name := names[0]
 
@@ -447,7 +603,7 @@ func admission(tree *matchersTree, names ...string) error {
 			return false
 		}
 		if adm := registry.AdmissionRegistry().Get(name); adm != nil {
-			return adm.Admit(context.Background(), req.ClientIP.String())
+			return adm.Admit(context.Background(), "ip", req.ClientIP.String())
 		}
 		return false
 	}

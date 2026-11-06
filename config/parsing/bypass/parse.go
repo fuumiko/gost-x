@@ -11,15 +11,22 @@ import (
 	"github.com/go-gost/x/config"
 	"github.com/go-gost/x/internal/loader"
 	"github.com/go-gost/x/internal/plugin"
+	xplugin "github.com/go-gost/x/plugin"
 	"github.com/go-gost/x/registry"
 )
 
+// ParseBypass converts a BypassConfig into a bypass.Bypass. It resolves plugin
+// backends (HTTP or gRPC) when cfg.Plugin is set, or constructs an in-process
+// bypass with optional file, Redis, and HTTP hot-reload support.
 func ParseBypass(cfg *config.BypassConfig) bypass.Bypass {
 	if cfg == nil {
 		return nil
 	}
 
 	if cfg.Plugin != nil {
+		if err := xplugin.Spawn(cfg.Plugin.Command); err != nil {
+			logger.Default().Errorf("spawn plugin %s: %v", cfg.Name, err)
+		}
 		var tlsCfg *tls.Config
 		if cfg.Plugin.TLS != nil {
 			tlsCfg = &tls.Config{
@@ -31,6 +38,7 @@ func ParseBypass(cfg *config.BypassConfig) bypass.Bypass {
 		case "http":
 			return bypass_plugin.NewHTTPPlugin(
 				cfg.Name, cfg.Plugin.Addr,
+				plugin.TokenOption(cfg.Plugin.Token),
 				plugin.TLSConfigOption(tlsCfg),
 				plugin.TimeoutOption(cfg.Plugin.Timeout),
 			)
@@ -46,6 +54,7 @@ func ParseBypass(cfg *config.BypassConfig) bypass.Bypass {
 	opts := []xbypass.Option{
 		xbypass.MatchersOption(cfg.Matchers),
 		xbypass.WhitelistOption(cfg.Reverse || cfg.Whitelist),
+		xbypass.NetworkOption(cfg.Network),
 		xbypass.ReloadPeriodOption(cfg.Reload),
 		xbypass.LoggerOption(logger.Default().WithFields(map[string]any{
 			"kind":   "bypass",
@@ -74,6 +83,8 @@ func ParseBypass(cfg *config.BypassConfig) bypass.Bypass {
 	return xbypass.NewBypass(opts...)
 }
 
+// List resolves one or more bypass names from the registry. It returns only
+// the bypasses that were found, skipping any that are not registered.
 func List(name string, names ...string) []bypass.Bypass {
 	var bypasses []bypass.Bypass
 	if bp := registry.BypassRegistry().Get(name); bp != nil {

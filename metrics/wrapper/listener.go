@@ -11,8 +11,12 @@ type listener struct {
 	net.Listener
 }
 
+// WrapListener wraps a net.Listener so that all accepted connections are
+// automatically wrapped with WrapConn for metrics tracking. If metrics are
+// not enabled, ln is returned unchanged to allow splice(2) optimization
+// on bare *net.TCPConn. If ln is nil, nil is returned.
 func WrapListener(service string, ln net.Listener) net.Listener {
-	if !xmetrics.IsWrapperEnabled() {
+	if ln == nil || !xmetrics.IsWrapperEnabled() {
 		return ln
 	}
 	return &listener{

@@ -107,7 +107,6 @@ func (h *forwardHandler) Handle(ctx context.Context, conn net.Conn, opts ...hand
 	log.Infof("%s <> %s", conn.RemoteAddr(), conn.LocalAddr())
 
 	pStats := xstats.Stats{}
-	conn = stats_wrapper.WrapConn(conn, &pStats)
 
 	defer func() {
 		if err != nil {
@@ -131,11 +130,11 @@ func (h *forwardHandler) Handle(ctx context.Context, conn net.Conn, opts ...hand
 		return rate_limiter.ErrRateLimit
 	}
 
-	switch cc := conn.(type) {
+	switch cc := unwrapConn(conn).(type) {
 	case *sshd_util.DirectForwardConn:
-		return h.handleDirectForward(ctx, cc, ro, log)
+		return h.handleDirectForward(ctx, cc.DstAddr(), conn, ro, log, &pStats)
 	case *sshd_util.RemoteForwardConn:
-		return h.handleRemoteForward(ctx, cc, ro, log)
+		return h.handleRemoteForward(ctx, cc, ro, log, &pStats)
 	default:
 		err := errors.New("sshd: wrong connection type")
 		log.Error(err)
@@ -143,8 +142,8 @@ func (h *forwardHandler) Handle(ctx context.Context, conn net.Conn, opts ...hand
 	}
 }
 
-func (h *forwardHandler) handleDirectForward(ctx context.Context, conn *sshd_util.DirectForwardConn, ro *xrecorder.HandlerRecorderObject, log logger.Logger) error {
-	targetAddr := conn.DstAddr()
+func (h *forwardHandler) handleDirectForward(ctx context.Context, targetAddr string, origConn net.Conn, ro *xrecorder.HandlerRecorderObject, log logger.Logger, stats *xstats.Stats) error {
+	conn := stats_wrapper.WrapConn(origConn, stats)
 
 	ro.Host = targetAddr
 	log = log.WithFields(map[string]any{
@@ -210,6 +209,7 @@ func (h *forwardHandler) handleDirectForward(ctx context.Context, conn *sshd_uti
 				sniffing.WithService(h.options.Service),
 				sniffing.WithDial(dial),
 				sniffing.WithDialTLS(dialTLS),
+				sniffing.WithBypass(h.options.Bypass),
 				sniffing.WithRecorderObject(ro),
 				sniffing.WithLog(log),
 			)
@@ -218,6 +218,7 @@ func (h *forwardHandler) handleDirectForward(ctx context.Context, conn *sshd_uti
 				sniffing.WithService(h.options.Service),
 				sniffing.WithDial(dial),
 				sniffing.WithDialTLS(dialTLS),
+				sniffing.WithBypass(h.options.Bypass),
 				sniffing.WithRecorderObject(ro),
 				sniffing.WithLog(log),
 			)
@@ -235,8 +236,9 @@ func (h *forwardHandler) handleDirectForward(ctx context.Context, conn *sshd_uti
 	return nil
 }
 
-func (h *forwardHandler) handleRemoteForward(ctx context.Context, conn *sshd_util.RemoteForwardConn, ro *xrecorder.HandlerRecorderObject, log logger.Logger) error {
-	req := conn.Request()
+func (h *forwardHandler) handleRemoteForward(ctx context.Context, c *sshd_util.RemoteForwardConn, ro *xrecorder.HandlerRecorderObject, log logger.Logger, stats *xstats.Stats) error {
+	req := c.Request()
+	conn := stats_wrapper.WrapConn(c, stats)
 
 	t := tcpipForward{}
 	if err := ssh.Unmarshal(req.Payload, &t); err != nil {
@@ -256,7 +258,9 @@ func (h *forwardHandler) handleRemoteForward(ctx context.Context, conn *sshd_uti
 	log.Debugf("%s >> %s", conn.RemoteAddr(), addr)
 
 	// tie to the client connection
-	ln, err := net.Listen(network, addr)
+	lc := net.ListenConfig{}
+	lc.SetMultipathTCP(false)
+	ln, err := lc.Listen(context.Background(), network, addr)
 	if err != nil {
 		log.Error(err)
 		req.Reply(false, nil)
@@ -290,7 +294,7 @@ func (h *forwardHandler) handleRemoteForward(ctx context.Context, conn *sshd_uti
 		return err
 	}
 
-	sshConn := conn.Conn()
+	sshConn := c.Conn()
 
 	go func() {
 		for {
@@ -340,7 +344,7 @@ func (h *forwardHandler) handleRemoteForward(ctx context.Context, conn *sshd_uti
 
 	tm := time.Now()
 	log.Infof("%s <-> %s", conn.RemoteAddr(), addr)
-	<-conn.Done()
+	<-c.Done()
 	log.WithFields(map[string]any{
 		"duration": time.Since(tm),
 	}).Infof("%s >-< %s", conn.RemoteAddr(), addr)
@@ -358,6 +362,28 @@ func (h *forwardHandler) checkRateLimit(addr net.Addr) bool {
 	}
 
 	return true
+}
+
+// connUnwrapper is an interface for unwrapping net.Conn wrappers to access
+// the underlying connection type.
+type connUnwrapper interface {
+	UnwrapConn() net.Conn
+}
+
+// unwrapConn peels through net.Conn wrapper layers (e.g. traffic limiters)
+// to find the underlying concrete connection type.
+func unwrapConn(c net.Conn) net.Conn {
+	for {
+		uw, ok := c.(connUnwrapper)
+		if !ok {
+			return c
+		}
+		if inner := uw.UnwrapConn(); inner != nil {
+			c = inner
+		} else {
+			return c
+		}
+	}
 }
 
 func getHostPortFromAddr(addr net.Addr) (host string, port int, err error) {

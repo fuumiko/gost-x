@@ -11,14 +11,21 @@ import (
 	ingress_plugin "github.com/go-gost/x/ingress/plugin"
 	"github.com/go-gost/x/internal/loader"
 	"github.com/go-gost/x/internal/plugin"
+	xplugin "github.com/go-gost/x/plugin"
 )
 
+// ParseIngress converts an IngressConfig into an ingress.Ingress. It resolves
+// plugin backends (HTTP or gRPC), parses inline hostname→endpoint rules, and
+// configures optional file, Redis, and HTTP hot-reload support.
 func ParseIngress(cfg *config.IngressConfig) ingress.Ingress {
 	if cfg == nil {
 		return nil
 	}
 
 	if cfg.Plugin != nil {
+		if err := xplugin.Spawn(cfg.Plugin.Command); err != nil {
+			logger.Default().Errorf("spawn plugin %s: %v", cfg.Name, err)
+		}
 		var tlsCfg *tls.Config
 		if cfg.Plugin.TLS != nil {
 			tlsCfg = &tls.Config{
@@ -30,6 +37,7 @@ func ParseIngress(cfg *config.IngressConfig) ingress.Ingress {
 		case "http":
 			return ingress_plugin.NewHTTPPlugin(
 				cfg.Name, cfg.Plugin.Addr,
+				plugin.TokenOption(cfg.Plugin.Token),
 				plugin.TLSConfigOption(tlsCfg),
 				plugin.TimeoutOption(cfg.Plugin.Timeout),
 			)

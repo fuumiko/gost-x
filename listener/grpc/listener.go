@@ -58,6 +58,7 @@ func (l *grpcListener) Init(md md.Metadata) (err error) {
 		network = "tcp4"
 	}
 	lc := net.ListenConfig{}
+	lc.SetMultipathTCP(false)
 	if l.md.mptcp {
 		lc.SetMultipathTCP(true)
 		l.logger.Debugf("mptcp enabled: %v", lc.MultipathTCP())
@@ -65,6 +66,16 @@ func (l *grpcListener) Init(md md.Metadata) (err error) {
 	ln, err := lc.Listen(context.Background(), network, l.options.Addr)
 	if err != nil {
 		return
+	}
+	if l.md.tcpKeepalive {
+		ln = xnet.WrapKeepaliveListener(ln, net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     l.md.tcpKeepaliveIdle,
+			Interval: l.md.tcpKeepaliveInterval,
+			Count:    l.md.tcpKeepaliveCount,
+		})
+		l.logger.Debugf("tcp keepalive enabled: idle=%v interval=%v count=%d",
+			l.md.tcpKeepaliveIdle, l.md.tcpKeepaliveInterval, l.md.tcpKeepaliveCount)
 	}
 
 	ln = proxyproto.WrapListener(l.options.ProxyProtocol, ln, 10*time.Second)

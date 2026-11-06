@@ -2,7 +2,9 @@ package tun
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/go-gost/core/limiter"
@@ -28,6 +30,8 @@ type tunListener struct {
 	addr    net.Addr
 	cqueue  chan net.Conn
 	closed  chan struct{}
+	active  net.Conn // wrapped conn currently accepted; closing it releases its device
+	mu      sync.Mutex
 	log     logger.Logger
 	md      metadata
 	options listener.Options
@@ -74,8 +78,20 @@ func (l *tunListener) Init(md mdata.Metadata) (err error) {
 
 func (l *tunListener) listenLoop(ready context.CancelCauseFunc) {
 	for {
+		select {
+		case <-l.closed:
+			return
+		default:
+		}
+
 		ctx, cancel := context.WithCancel(context.Background())
-		err := func() error {
+		err := func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panic in createTun: %v", r)
+				}
+			}()
+
 			ifce, name, ip, err := l.createTun()
 			if err != nil {
 				if ifce != nil {
@@ -84,14 +100,15 @@ func (l *tunListener) listenLoop(ready context.CancelCauseFunc) {
 				return err
 			}
 
-			itf, err := net.InterfaceByName(name)
-			if err != nil {
-				return err
+			// Informational only: on Android the device belongs to the
+			// VpnService and the interface may not be listed in this process.
+			if itf, err := net.InterfaceByName(name); err != nil {
+				l.log.Warnf("interface %s: %v", name, err)
+			} else {
+				addrs, _ := itf.Addrs()
+				l.log.Infof("name: %s, net: %s, mtu: %d, addrs: %s",
+					itf.Name, ip, l.md.config.MTU, addrs)
 			}
-
-			addrs, _ := itf.Addrs()
-			l.log.Infof("name: %s, net: %s, mtu: %d, addrs: %s",
-				itf.Name, ip, l.md.config.MTU, addrs)
 
 			ctx = ictx.ContextWithMetadata(ctx, mdx.NewMetadata(map[string]any{
 				"config": l.md.config,
@@ -116,7 +133,22 @@ func (l *tunListener) listenLoop(ready context.CancelCauseFunc) {
 				limiter.NetworkOption(c.LocalAddr().Network()),
 			)
 
-			l.cqueue <- c
+			l.mu.Lock()
+			l.active = c
+			closed := l.isClosed()
+			l.mu.Unlock()
+
+			select {
+			case l.cqueue <- c:
+			case <-l.closed:
+				// Close beat us to the queue: the conn is already being torn
+				// down, so release its device instead of handing it out.
+				closed = true
+			}
+
+			if closed {
+				c.Close()
+			}
 
 			return nil
 		}()
@@ -130,10 +162,29 @@ func (l *tunListener) listenLoop(ready context.CancelCauseFunc) {
 		select {
 		case <-ctx.Done():
 		case <-l.closed:
+			// Closing the accepted conn releases its device fd, which removes
+			// the tun interface from the kernel, so a subsequent reload with
+			// the same device name can recreate it instead of failing with
+			// "device or resource busy" (gost#901).
+			l.mu.Lock()
+			if l.active != nil {
+				l.active.Close()
+				l.active = nil
+			}
+			l.mu.Unlock()
 			return
 		}
 
 		time.Sleep(time.Second)
+	}
+}
+
+func (l *tunListener) isClosed() bool {
+	select {
+	case <-l.closed:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -157,6 +208,16 @@ func (l *tunListener) Close() error {
 		return net.ErrClosed
 	default:
 		close(l.closed)
+	}
+
+	// Close the accepted conn so its device is released even if the listen
+	// loop is mid-iteration (e.g. blocked re-creating the device). conn.Close
+	// is idempotent, so this is safe even when the handler closes it too.
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.active != nil {
+		l.active.Close()
+		l.active = nil
 	}
 	return nil
 }

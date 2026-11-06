@@ -15,15 +15,38 @@ import (
 	"github.com/go-gost/x/config"
 	"github.com/go-gost/x/internal/loader"
 	"github.com/go-gost/x/internal/plugin"
+	xplugin "github.com/go-gost/x/plugin"
 	"github.com/go-gost/x/registry"
 )
 
+// ParseAuther converts an AutherConfig into an auth.Authenticator. It handles
+// plugin backends (HTTP or gRPC), inline auth credentials, and optional file,
+// Redis, and HTTP hot-reload sources.
+//
+// A configuration error, e.g. an unsupported auth file format, is logged and
+// the affected loader is skipped. Use [ParseAutherWithError] to get the error
+// instead.
 func ParseAuther(cfg *config.AutherConfig) auth.Authenticator {
+	a, err := ParseAutherWithError(cfg)
+	if err != nil {
+		logger.Default().Errorf("auther %s: %v", cfg.Name, err)
+	}
+	return a
+}
+
+// ParseAutherWithError is like [ParseAuther] but reports a configuration
+// error, e.g. an unsupported auth file format. An invalid format is a
+// configuration error: it is reported instead of being silently ignored,
+// because silently ignoring it would leave the auther without credentials.
+func ParseAutherWithError(cfg *config.AutherConfig) (auth.Authenticator, error) {
 	if cfg == nil {
-		return nil
+		return nil, nil
 	}
 
 	if cfg.Plugin != nil {
+		if err := xplugin.Spawn(cfg.Plugin.Command); err != nil {
+			logger.Default().Errorf("spawn plugin %s: %v", cfg.Name, err)
+		}
 		var tlsCfg *tls.Config
 		if cfg.Plugin.TLS != nil {
 			tlsCfg = &tls.Config{
@@ -35,15 +58,16 @@ func ParseAuther(cfg *config.AutherConfig) auth.Authenticator {
 		case "http":
 			return auth_plugin.NewHTTPPlugin(
 				cfg.Name, cfg.Plugin.Addr,
+				plugin.TokenOption(cfg.Plugin.Token),
 				plugin.TLSConfigOption(tlsCfg),
 				plugin.TimeoutOption(cfg.Plugin.Timeout),
-			)
+			), nil
 		default:
 			return auth_plugin.NewGRPCPlugin(
 				cfg.Name, cfg.Plugin.Addr,
 				plugin.TokenOption(cfg.Plugin.Token),
 				plugin.TLSConfigOption(tlsCfg),
-			)
+			), nil
 		}
 	}
 
@@ -65,7 +89,13 @@ func ParseAuther(cfg *config.AutherConfig) auth.Authenticator {
 		})),
 	}
 	if cfg.File != nil && cfg.File.Path != "" {
-		opts = append(opts, xauth.FileLoaderOption(loader.FileLoader(cfg.File.Path)))
+		if err := xauth.ValidateFormat(cfg.File.Format); err != nil {
+			return nil, err
+		}
+		opts = append(opts,
+			xauth.FileLoaderOption(loader.FileLoader(cfg.File.Path)),
+			xauth.FileFormatOption(cfg.File.Format),
+		)
 	}
 	if cfg.Redis != nil && cfg.Redis.Addr != "" {
 		opts = append(opts, xauth.RedisLoaderOption(loader.RedisHashLoader(
@@ -77,14 +107,23 @@ func ParseAuther(cfg *config.AutherConfig) auth.Authenticator {
 		)))
 	}
 	if cfg.HTTP != nil && cfg.HTTP.URL != "" {
-		opts = append(opts, xauth.HTTPLoaderOption(loader.HTTPLoader(
-			cfg.HTTP.URL,
-			loader.TimeoutHTTPLoaderOption(cfg.HTTP.Timeout),
-		)))
+		if err := xauth.ValidateFormat(cfg.HTTP.Format); err != nil {
+			return nil, err
+		}
+		opts = append(opts,
+			xauth.HTTPLoaderOption(loader.HTTPLoader(
+				cfg.HTTP.URL,
+				loader.TimeoutHTTPLoaderOption(cfg.HTTP.Timeout),
+			)),
+			xauth.HTTPFormatOption(cfg.HTTP.Format),
+		)
 	}
-	return xauth.NewAuthenticator(opts...)
+	return xauth.NewAuthenticator(opts...), nil
 }
 
+// ParseAutherFromAuth creates a simple authenticator from a single
+// username/password pair in an AuthConfig. Returns nil if the config is nil or
+// has no username.
 func ParseAutherFromAuth(au *config.AuthConfig) auth.Authenticator {
 	if au == nil || au.Username == "" {
 		return nil
@@ -101,6 +140,9 @@ func ParseAutherFromAuth(au *config.AuthConfig) auth.Authenticator {
 	)
 }
 
+// Info extracts authentication credentials from an AuthConfig as a
+// url.Userinfo. It supports reading the first line from a password file when
+// cfg.File is set, or falls back to inline username/password fields.
 func Info(cfg *config.AuthConfig) *url.Userinfo {
 	if cfg == nil {
 		return nil
@@ -158,6 +200,9 @@ func parseInfo(r io.Reader, max int) (infos []*url.Userinfo, err error) {
 	return
 }
 
+// List resolves one or more authenticator names from the registry. It returns
+// only the authenticators that were found, skipping any that are not
+// registered.
 func List(name string, names ...string) []auth.Authenticator {
 	var authers []auth.Authenticator
 	if auther := registry.AutherRegistry().Get(name); auther != nil {

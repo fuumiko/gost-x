@@ -4,6 +4,7 @@ import (
 	"time"
 
 	mdata "github.com/go-gost/core/metadata"
+	"github.com/go-gost/x/internal/util/ech"
 	mdutil "github.com/go-gost/x/metadata/util"
 )
 
@@ -15,6 +16,8 @@ type metadata struct {
 	enableDatagram   bool
 
 	cipherKey []byte
+
+	ech ech.Config
 }
 
 func (d *quicDialer) parseMetadata(md mdata.Metadata) (err error) {
@@ -40,8 +43,13 @@ func (d *quicDialer) parseMetadata(md mdata.Metadata) (err error) {
 	}
 	d.md.handshakeTimeout = mdutil.GetDuration(md, handshakeTimeout)
 	d.md.maxIdleTimeout = mdutil.GetDuration(md, maxIdleTimeout)
+	if d.md.maxIdleTimeout <= 0 {
+		d.md.maxIdleTimeout = 90 * time.Second
+	}
 	d.md.maxStreams = mdutil.GetInt(md, maxStreams)
 	d.md.enableDatagram = mdutil.GetBool(md, "quic.enableDatagram", "enableDatagram")
+
+	d.md.ech = ech.FromMetadata(md)
 
 	return
 }

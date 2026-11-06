@@ -7,6 +7,9 @@ import (
 	xs "github.com/go-gost/x/selector"
 )
 
+// ParseChainSelector creates a chain-level selector from a SelectorConfig. If
+// cfg is nil it returns nil. Strategy defaults to round-robin when unrecognized
+// or unset.
 func ParseChainSelector(cfg *config.SelectorConfig) selector.Selector[chain.Chainer] {
 	if cfg == nil {
 		return nil
@@ -32,6 +35,9 @@ func ParseChainSelector(cfg *config.SelectorConfig) selector.Selector[chain.Chai
 	)
 }
 
+// ParseNodeSelector creates a node-level selector from a SelectorConfig. If
+// cfg is nil it returns nil. Supported strategies: round/rr, random/rand,
+// fifo/ha, hash, and parallel. Defaults to round-robin.
 func ParseNodeSelector(cfg *config.SelectorConfig) selector.Selector[*chain.Node] {
 	if cfg == nil {
 		return nil
@@ -47,17 +53,30 @@ func ParseNodeSelector(cfg *config.SelectorConfig) selector.Selector[*chain.Node
 		strategy = xs.FIFOStrategy[*chain.Node]()
 	case "hash":
 		strategy = xs.HashStrategy[*chain.Node]()
+	case "parallel":
+		strategy = xs.ParallelStrategy[*chain.Node](
+			xs.ParallelLimit(cfg.MaxParallel),
+			xs.ParallelMode(cfg.ParallelMode),
+		)
+	case "lowestlatency", "lowest", "ll":
+		strategy = xs.LowestLatencyStrategy[*chain.Node]()
 	default:
 		strategy = xs.RoundRobinStrategy[*chain.Node]()
 	}
 
-	return xs.NewSelector(
-		strategy,
+	filters := []selector.Filter[*chain.Node]{
 		xs.FailFilter[*chain.Node](cfg.MaxFails, cfg.FailTimeout),
 		xs.BackupFilter[*chain.Node](),
-	)
+	}
+	if cfg.MaxLatency > 0 {
+		filters = append(filters, xs.LatencyFilter[*chain.Node](cfg.MaxLatency))
+	}
+
+	return xs.NewSelector(strategy, filters...)
 }
 
+// DefaultNodeSelector returns a node selector using round-robin strategy with
+// default fail filter settings.
 func DefaultNodeSelector() selector.Selector[*chain.Node] {
 	return xs.NewSelector(
 		xs.RoundRobinStrategy[*chain.Node](),
@@ -66,6 +85,8 @@ func DefaultNodeSelector() selector.Selector[*chain.Node] {
 	)
 }
 
+// DefaultChainSelector returns a chain selector using round-robin strategy
+// with default fail filter settings.
 func DefaultChainSelector() selector.Selector[chain.Chainer] {
 	return xs.NewSelector(
 		xs.RoundRobinStrategy[chain.Chainer](),

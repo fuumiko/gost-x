@@ -14,14 +14,27 @@ import (
 )
 
 type metadata struct {
-	publicAddr        string
+	recorderPeriod time.Duration // reports a live session on this interval; 0 = one record per session, written when it ends.
+
+	publicAddr string
+	// readTimeout is the deadline for reading the initial SOCKS5
+	// handshake (auth + connect/associate/udp request) from the client
+	// connection. The deadline is cleared after the handshake, so it
+	// does not affect subsequent data transfer. Also passed to
+	// SnifferBuilder for the upstream response header read timeout.
+	// 0 or negative defaults to 15s.
 	readTimeout       time.Duration
 	noTLS             bool
 	enableBind        bool
 	enableUDP         bool
 	udpBufferSize     int
+	udpResolveDomain  bool
+	udpBindDevice     bool
+	udpBindMin        int
+	udpBindMax        int
 	compatibilityMode bool
 	hash              string
+	enableTor         bool
 	muxCfg            *mux.Config
 
 	observerPeriod       time.Duration
@@ -42,6 +55,8 @@ type metadata struct {
 }
 
 func (h *socks5Handler) parseMetadata(md mdata.Metadata) (err error) {
+	h.md.recorderPeriod = mdutil.GetDuration(md, "recorder.period", "recorder.reportPeriod")
+
 	h.md.publicAddr = mdutil.GetString(md, "socks.publicAddr", "publicAddr")
 	h.md.readTimeout = mdutil.GetDuration(md, "readTimeout")
 	if h.md.readTimeout <= 0 {
@@ -52,9 +67,14 @@ func (h *socks5Handler) parseMetadata(md mdata.Metadata) (err error) {
 	h.md.enableBind = mdutil.GetBool(md, "bind")
 	h.md.enableUDP = mdutil.GetBool(md, "udp")
 	h.md.udpBufferSize = mdutil.GetInt(md, "udp.bufferSize", "udpBufferSize")
+	h.md.udpResolveDomain = mdutil.GetBool(md, "udp.resolveDomain", "udpResolveDomain")
+	h.md.udpBindDevice = mdutil.GetBool(md, "udp.bindDevice", "udpBindDevice")
+	h.md.udpBindMin = mdutil.GetInt(md, "udp.bindRange.min", "udp.minPort")
+	h.md.udpBindMax = mdutil.GetInt(md, "udp.bindRange.max", "udp.maxPort")
 
 	h.md.compatibilityMode = mdutil.GetBool(md, "comp")
 	h.md.hash = mdutil.GetString(md, "hash")
+	h.md.enableTor = mdutil.GetBool(md, "tor", "enableTor", "socks5.tor")
 
 	h.md.muxCfg = &mux.Config{
 		Version:           mdutil.GetInt(md, "mux.version"),
@@ -64,6 +84,8 @@ func (h *socks5Handler) parseMetadata(md mdata.Metadata) (err error) {
 		MaxFrameSize:      mdutil.GetInt(md, "mux.maxFrameSize"),
 		MaxReceiveBuffer:  mdutil.GetInt(md, "mux.maxReceiveBuffer"),
 		MaxStreamBuffer:   mdutil.GetInt(md, "mux.maxStreamBuffer"),
+		Type:              mdutil.GetString(md, "mux.type"),
+		MaxStreamWindow:   mdutil.GetInt(md, "mux.maxStreamWindow"),
 	}
 
 	h.md.observerPeriod = mdutil.GetDuration(md, "observePeriod", "observer.period", "observer.observePeriod")

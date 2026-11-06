@@ -1,3 +1,6 @@
+// Package service implements the core [service.Service] interface, binding a
+// [listener.Listener] and a [handler.Handler] into a runnable proxy service
+// that accepts inbound connections and forwards traffic through a proxy chain.
 package service
 
 import (
@@ -21,7 +24,11 @@ import (
 	"github.com/go-gost/core/observer/stats"
 	"github.com/go-gost/core/recorder"
 	"github.com/go-gost/core/service"
+	xbypass "github.com/go-gost/x/bypass"
 	xctx "github.com/go-gost/x/ctx"
+	connwrapper "github.com/go-gost/x/limiter/conn/wrapper"
+	rate_limiter "github.com/go-gost/x/limiter/rate"
+	xlogger "github.com/go-gost/x/logger"
 	xmetrics "github.com/go-gost/x/metrics"
 	xstats "github.com/go-gost/x/observer/stats"
 	"github.com/google/shlex"
@@ -39,64 +46,95 @@ type options struct {
 	observer       observer.Observer
 	observerPeriod time.Duration
 	logger         logger.Logger
+	labels         map[string]string
+	closers        []io.Closer
 }
 
+// Option is a functional option for configuring a service.
 type Option func(opts *options)
 
+// AdmissionOption sets the admission controller that filters connections by
+// source address.
 func AdmissionOption(admission admission.Admission) Option {
 	return func(opts *options) {
 		opts.admission = admission
 	}
 }
 
+// RecordersOption sets the traffic recorders for the service.
 func RecordersOption(recorders ...recorder.RecorderObject) Option {
 	return func(opts *options) {
 		opts.recorders = recorders
 	}
 }
 
+// PreUpOption sets shell commands to run before the service starts.
 func PreUpOption(cmds []string) Option {
 	return func(opts *options) {
 		opts.preUp = cmds
 	}
 }
 
+// PreDownOption sets shell commands to run before the service stops.
 func PreDownOption(cmds []string) Option {
 	return func(opts *options) {
 		opts.preDown = cmds
 	}
 }
 
+// PostUpOption sets shell commands to run after the service starts listening.
 func PostUpOption(cmds []string) Option {
 	return func(opts *options) {
 		opts.postUp = cmds
 	}
 }
 
+// PostDownOption sets shell commands to run after the service stops.
 func PostDownOption(cmds []string) Option {
 	return func(opts *options) {
 		opts.postDown = cmds
 	}
 }
 
+// StatsOption sets the traffic statistics collector for the service.
 func StatsOption(stats stats.Stats) Option {
 	return func(opts *options) {
 		opts.stats = stats
 	}
 }
 
+// ObserverOption sets the observer that receives service state and stats events.
 func ObserverOption(observer observer.Observer) Option {
 	return func(opts *options) {
 		opts.observer = observer
 	}
 }
 
+// ObserverPeriodOption sets the interval at which stats are reported to the
+// observer. Defaults to 5 seconds with a minimum of 1 second.
 func ObserverPeriodOption(period time.Duration) Option {
 	return func(opts *options) {
 		opts.observerPeriod = period
 	}
 }
 
+// LabelsOption sets the static labels attached to the service's records
+// and logs.
+func LabelsOption(labels map[string]string) Option {
+	return func(opts *options) {
+		opts.labels = labels
+	}
+}
+
+// ClosersOption registers io.Closers that are called on service shutdown.
+func ClosersOption(closers ...io.Closer) Option {
+	return func(opts *options) {
+		opts.closers = append(opts.closers, closers...)
+	}
+}
+
+// LoggerOption sets the logger for the service. If not provided, a no-op
+// logger is used.
 func LoggerOption(logger logger.Logger) Option {
 	return func(opts *options) {
 		opts.logger = logger
@@ -111,10 +149,26 @@ type defaultService struct {
 	options  options
 }
 
+// closedStop reports whether an accept error means the service was closed rather
+// than broken: the listener's own sentinel, the socket's, or a pipe whose other
+// end went away. It is consulted twice — once to end the loop quietly, and once
+// so a closed listener is never logged as a failure.
+func closedStop(e error) bool {
+	return errors.Is(e, net.ErrClosed) ||
+		errors.Is(e, listener.ErrClosed) ||
+		errors.Is(e, io.ErrClosedPipe)
+}
+
+// NewService creates a new service that binds the given listener and handler.
+// The service is registered in the running state and pre-up commands are
+// executed immediately. Call [Serve] to start accepting connections.
 func NewService(name string, ln listener.Listener, h handler.Handler, opts ...Option) service.Service {
 	var options options
 	for _, opt := range opts {
 		opt(&options)
+	}
+	if options.logger == nil {
+		options.logger = xlogger.Nop()
 	}
 	s := &defaultService{
 		name:     name,
@@ -134,10 +188,14 @@ func NewService(name string, ln listener.Listener, h handler.Handler, opts ...Op
 	return s
 }
 
+// Addr returns the network address the service is listening on.
 func (s *defaultService) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
+// Serve starts the accept loop. It blocks until the listener is closed or a
+// fatal accept error occurs. Each accepted connection is handled in its own
+// goroutine by the service's handler.
 func (s *defaultService) Serve() error {
 	s.execCmds("post-up", s.options.postUp)
 	s.setState(StateReady)
@@ -174,6 +232,17 @@ func (s *defaultService) Serve() error {
 				tempDelay = 0
 			}
 
+			// A connection refused by the conn limiter is a per-connection
+			// outcome, not a listener failure: that connection is already
+			// closed and the listener is still usable. Returning it as fatal
+			// ended the accept loop, so one rejection stopped the service for
+			// good and every later connection was refused until a restart
+			// (gost#914). Keep accepting.
+			if errors.Is(e, connwrapper.ErrConnLimit) {
+				log.Warnf("accept: %v", e)
+				continue
+			}
+
 			// TODO: remove Temporary checking
 			if ne, ok := e.(net.Error); ok && ne.Temporary() {
 				if tempDelay == 0 {
@@ -186,14 +255,35 @@ func (s *defaultService) Serve() error {
 				}
 
 				s.setState(StateFailed)
+				s.status.setLastError(e)
 
-				log.Warnf("accept: %v, retrying in %v", e, tempDelay)
+				// The retry itself is deliberate and stays: a remote listener
+				// wraps an accept failure in AcceptError, which always claims
+				// Temporary(), to say "rebuild the transport and try again" — a
+				// closed pipe under it is exactly the case that recovers that
+				// way, so ending the service here would break port hopping.
+				// What is wrong is the wording: on a stop the same error arrives,
+				// and a warning that promises a retry reads like a hiccup. Log it
+				// by what it is.
+				if closedStop(e) {
+					log.Debugf("accept: %v, retrying in %v", e, tempDelay)
+				} else {
+					log.Warnf("accept: %v, retrying in %v", e, tempDelay)
+				}
 				time.Sleep(tempDelay)
+
+				// Transition back to Ready so status observers see the
+				// recovered service immediately, instead of waiting for
+				// the next successful Accept (which may block arbitrarily).
+				if s.status.State() == StateFailed {
+					s.setState(StateReady)
+					s.status.setLastError(nil)
+				}
 				continue
 			}
 			s.setState(StateClosed)
 
-			if !errors.Is(e, net.ErrClosed) {
+			if !closedStop(e) {
 				log.Errorf("accept: %v", e)
 			}
 
@@ -204,7 +294,6 @@ func (s *defaultService) Serve() error {
 
 		if tempDelay > 0 {
 			tempDelay = 0
-			s.setState(StateReady)
 		}
 
 		ctx := gctx
@@ -216,6 +305,10 @@ func (s *defaultService) Serve() error {
 
 		sid := xid.New().String()
 		ctx = xctx.ContextWithSid(ctx, xctx.Sid(sid))
+
+		if len(s.options.labels) > 0 {
+			ctx = xctx.ContextWithLabels(ctx, s.options.labels)
+		}
 
 		log := s.options.logger.WithFields(map[string]any{
 			"sid": sid,
@@ -247,7 +340,7 @@ func (s *defaultService) Serve() error {
 			}
 		}
 		if s.options.admission != nil &&
-			!s.options.admission.Admit(ctx, srcAddr.String(), admission.WithService(s.name)) {
+			!s.options.admission.Admit(ctx, srcAddr.Network(), srcAddr.String(), admission.WithService(s.name)) {
 			conn.Close()
 			log.Debugf("admission: %s is denied", srcAddr)
 			continue
@@ -278,36 +371,61 @@ func (s *defaultService) Serve() error {
 			}
 
 			if err := s.handler.Handle(ctx, conn); err != nil {
-				log.Error(err)
-				if v := xmetrics.GetCounter(xmetrics.MetricServiceHandlerErrorsCounter,
-					metrics.Labels{"service": s.name, "client": clientIP}); v != nil {
-					v.Inc()
-				}
-				if sts := s.status.stats; sts != nil {
-					sts.Add(stats.KindTotalErrs, 1)
+				if isServerError(err) {
+					log.Error(err)
+					if v := xmetrics.GetCounter(xmetrics.MetricServiceHandlerErrorsCounter,
+						metrics.Labels{"service": s.name, "client": clientIP}); v != nil {
+						v.Inc()
+					}
+					if sts := s.status.stats; sts != nil {
+						sts.Add(stats.KindTotalErrs, 1)
+					}
+				} else {
+					log.Debug(err)
 				}
 			}
 		}()
 	}
 }
 
+// Status returns the runtime status of the service.
 func (s *defaultService) Status() *Status {
 	return s.status
 }
 
+// Close shuts down the service by closing the handler, observer, and listener
+// in order. All errors are collected and returned as a joined error.
 func (s *defaultService) Close() error {
 	s.execCmds("pre-down", s.options.preDown)
 	defer s.execCmds("post-down", s.options.postDown)
 
+	var errs []error
 	if closer, ok := s.handler.(io.Closer); ok {
-		closer.Close()
+		if err := closer.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return s.listener.Close()
+	if s.options.observer != nil {
+		if closer, ok := s.options.observer.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	for _, c := range s.options.closers {
+		if err := c.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := s.listener.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func (s *defaultService) execCmds(phase string, cmds []string) {
-	for _, cmd := range cmds {
-		cmd := strings.TrimSpace(cmd)
+	for _, raw := range cmds {
+		cmd := strings.TrimSpace(raw)
 		if cmd == "" {
 			continue
 		}
@@ -406,6 +524,23 @@ func (s *defaultService) observeStats(ctx context.Context) {
 	}
 }
 
+// isServerError reports whether err represents a server-side or infrastructure
+// failure that should be counted as a handler error. Client-side disconnects
+// (io.EOF, net.ErrClosed, context cancellation) and policy decisions (rate
+// limiting, bypass routing) are not server errors.
+func isServerError(err error) bool {
+	if errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, xbypass.ErrBypass) ||
+		errors.Is(err, rate_limiter.ErrRateLimit) {
+		return false
+	}
+	return true
+}
+
+// ServiceEvent is an observer event representing a service state change.
 type ServiceEvent struct {
 	Kind    string
 	Service string
@@ -413,6 +548,7 @@ type ServiceEvent struct {
 	Msg     string
 }
 
+// Type returns the observer event type for service events.
 func (ServiceEvent) Type() observer.EventType {
 	return observer.EventStatus
 }

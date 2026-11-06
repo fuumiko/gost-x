@@ -12,14 +12,21 @@ import (
 	hosts_plugin "github.com/go-gost/x/hosts/plugin"
 	"github.com/go-gost/x/internal/loader"
 	"github.com/go-gost/x/internal/plugin"
+	xplugin "github.com/go-gost/x/plugin"
 )
 
+// ParseHostMapper converts a HostsConfig into a hosts.HostMapper. It resolves
+// plugin backends (HTTP or gRPC), parses inline IP→hostname mappings, and
+// configures optional file, Redis, and HTTP hot-reload support.
 func ParseHostMapper(cfg *config.HostsConfig) hosts.HostMapper {
 	if cfg == nil {
 		return nil
 	}
 
 	if cfg.Plugin != nil {
+		if err := xplugin.Spawn(cfg.Plugin.Command); err != nil {
+			logger.Default().Errorf("spawn plugin %s: %v", cfg.Name, err)
+		}
 		var tlsCfg *tls.Config
 		if cfg.Plugin.TLS != nil {
 			tlsCfg = &tls.Config{
@@ -31,6 +38,7 @@ func ParseHostMapper(cfg *config.HostsConfig) hosts.HostMapper {
 		case "http":
 			return hosts_plugin.NewHTTPPlugin(
 				cfg.Name, cfg.Plugin.Addr,
+				plugin.TokenOption(cfg.Plugin.Token),
 				plugin.TLSConfigOption(tlsCfg),
 				plugin.TimeoutOption(cfg.Plugin.Timeout),
 			)

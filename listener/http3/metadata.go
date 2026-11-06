@@ -19,6 +19,7 @@ type metadata struct {
 	maxIdleTimeout   time.Duration
 	handshakeTimeout time.Duration
 	maxStreams       int
+	enableDatagrams  bool
 }
 
 func (l *http3Listener) parseMetadata(md mdata.Metadata) (err error) {
@@ -46,6 +47,11 @@ func (l *http3Listener) parseMetadata(md mdata.Metadata) (err error) {
 	l.md.handshakeTimeout = mdutil.GetDuration(md, handshakeTimeout)
 	l.md.maxIdleTimeout = mdutil.GetDuration(md, maxIdleTimeout)
 	l.md.maxStreams = mdutil.GetInt(md, maxStreams)
+	if mdutil.IsExists(md, "enableDatagrams") {
+		l.md.enableDatagrams = mdutil.GetBool(md, "enableDatagrams")
+	} else {
+		l.md.enableDatagrams = true
+	}
 
 	return
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/go-gost/x/internal/net/udp"
 	"github.com/go-gost/x/internal/util/socks"
 	traffic_wrapper "github.com/go-gost/x/limiter/traffic/wrapper"
+	xstats "github.com/go-gost/x/observer/stats"
 	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
 	xrecorder "github.com/go-gost/x/recorder"
 )
@@ -68,7 +69,11 @@ func (h *socks5Handler) handleUDPTun(ctx context.Context, conn net.Conn, network
 
 		// obtain a udp connection
 		var buf bytes.Buffer
-		c, err := h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &buf), network, "") // UDP association
+		dialContext := ictx.ContextWithBuffer(ctx, &buf)
+		if h.md.udpBindDevice {
+			dialContext = ictx.ContextWithUDPBindDevice(dialContext)
+		}
+		c, err := h.options.Router.Dial(dialContext, network, "") // UDP association
 		ro.Route = buf.String()
 		if err != nil {
 			log.Error(err)
@@ -95,6 +100,7 @@ func (h *socks5Handler) handleUDPTun(ctx context.Context, conn net.Conn, network
 		lc := xnet.ListenConfig{
 			Netns: h.options.Netns,
 		}
+		lc.ListenConfig.SetMultipathTCP(false)
 		var err error
 		pc, err = lc.ListenPacket(ctx, network, bindAddr.String())
 		if err != nil {
@@ -108,11 +114,33 @@ func (h *socks5Handler) handleUDPTun(ctx context.Context, conn net.Conn, network
 	}
 	defer pc.Close()
 
+	// If the upstream is a raw *net.UDPConn (direct dial or BIND mode),
+	// wrap it so domainAddr from socks.UDPTunServerConn.ReadFrom are
+	// resolved through the configured resolver instead of failing WriteTo.
+	if _, ok := pc.(*net.UDPConn); ok {
+		pc = &resolvePacketConn{
+			PacketConn: pc,
+			resolver:   h.options.Router.Options().Resolver,
+			hostMapper: h.options.Router.Options().HostMapper,
+		}
+	}
+
+	{
+		pStats := xstats.Stats{}
+		pc = stats_wrapper.WrapPacketConn(pc, &pStats)
+
+		defer func() {
+			ro.InputBytes += pStats.Get(stats.KindInputBytes)
+			ro.OutputBytes += pStats.Get(stats.KindOutputBytes)
+		}()
+	}
+
 	log = log.WithFields(map[string]any{
 		"src":  pc.LocalAddr().String(),
 		"bind": pc.LocalAddr().String(),
 	})
 	ro.SrcAddr = pc.LocalAddr().String()
+	ictx.SessionFromContext(ctx).Start(*ro)
 
 	saddr := gosocks5.Addr{}
 	saddr.ParseFrom(pc.LocalAddr().String())

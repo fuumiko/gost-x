@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-gost/core/chain"
 	"github.com/go-gost/core/connector"
@@ -20,38 +22,346 @@ import (
 	tls_util "github.com/go-gost/x/internal/util/tls"
 	mdx "github.com/go-gost/x/metadata"
 	mdutil "github.com/go-gost/x/metadata/util"
+	xp2p "github.com/go-gost/x/p2p"
 	"github.com/go-gost/x/registry"
 	"github.com/go-gost/x/routing"
 )
+
+// DefaultMatcherBodySize is the default request body prefix (in bytes) exposed
+// to body matchers when a node has BodyRegexp/BodyJSON matchers but no
+// explicit bodySize.
+const DefaultMatcherBodySize = 1 << 20 // 1MB
+
+// MaxMatcherBodySize is the hard cap for matcher body prefix. Values above
+// this are silently clamped. Protects against unbounded in-memory buffering
+// when a node opts in to body matching.
+const MaxMatcherBodySize = 10 << 20 // 10MB
+
+// IsReference reports whether cfg contains only a non-empty name. Such a
+// config references a definition from the top-level nodes section.
+// Any additional field, even a zero-valued one set explicitly (e.g. an
+// empty but non-nil connector), makes the config inline.
+// NOTE: keep this in sync with NodeConfig — a new field must be added here,
+// otherwise a config setting only that field would misresolve as a reference.
+func IsReference(cfg *config.NodeConfig) bool {
+	if cfg == nil || strings.TrimSpace(cfg.Name) == "" {
+		return false
+	}
+	return cfg.Addr == "" && cfg.Network == "" && cfg.Bypass == "" &&
+		len(cfg.Bypasses) == 0 && cfg.Resolver == "" && cfg.Hosts == "" &&
+		cfg.Connector == nil && cfg.Dialer == nil &&
+		cfg.Interface == "" && cfg.Netns == "" && cfg.SockOpts == nil &&
+		cfg.Filter == nil && cfg.Matcher == nil && cfg.HTTP == nil &&
+		cfg.TLS == nil && cfg.Probe == nil && len(cfg.Metadata) == 0
+}
+
+// ResolveConfig resolves a name-only config through the global node registry
+// and returns an independent copy of the definition. Inline configs are
+// returned unchanged to preserve their existing parsing behavior.
+func ResolveConfig(cfg *config.NodeConfig) (*config.NodeConfig, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	if !IsReference(cfg) {
+		return cfg, nil
+	}
+
+	name := strings.TrimSpace(cfg.Name)
+	cfg = registry.NodeRegistry().Get(name)
+	if cfg == nil {
+		return nil, fmt.Errorf("node %q not found", name)
+	}
+	return cloneConfig(cfg), nil
+}
+
+// cloneConfig returns a deep copy of cfg so that parsing (hop-level
+// inheritance, connector/dialer type defaults, TLS ServerName defaulting)
+// only ever mutates the copy, never the shared global definition.
+// NOTE: keep this in sync with NodeConfig — a new reference-type field
+// must be cloned here, otherwise hops would share it with the registry.
+func cloneConfig(cfg *config.NodeConfig) *config.NodeConfig {
+	c := *cfg
+	c.Bypasses = append([]string(nil), cfg.Bypasses...)
+	if cfg.Metadata != nil {
+		c.Metadata = make(map[string]any, len(cfg.Metadata))
+		for k, v := range cfg.Metadata {
+			c.Metadata[k] = v
+		}
+	}
+	if cfg.Connector != nil {
+		connector := *cfg.Connector
+		connector.Auth = cloneAuth(cfg.Connector.Auth)
+		connector.TLS = cloneTLSConfig(cfg.Connector.TLS)
+		if cfg.Connector.Metadata != nil {
+			connector.Metadata = make(map[string]any, len(cfg.Connector.Metadata))
+			for k, v := range cfg.Connector.Metadata {
+				connector.Metadata[k] = v
+			}
+		}
+		c.Connector = &connector
+	}
+	if cfg.Dialer != nil {
+		dialer := *cfg.Dialer
+		dialer.Auth = cloneAuth(cfg.Dialer.Auth)
+		dialer.TLS = cloneTLSConfig(cfg.Dialer.TLS)
+		if cfg.Dialer.Metadata != nil {
+			dialer.Metadata = make(map[string]any, len(cfg.Dialer.Metadata))
+			for k, v := range cfg.Dialer.Metadata {
+				dialer.Metadata[k] = v
+			}
+		}
+		c.Dialer = &dialer
+	}
+	if cfg.SockOpts != nil {
+		sockOpts := *cfg.SockOpts
+		c.SockOpts = &sockOpts
+	}
+	if cfg.Filter != nil {
+		filter := *cfg.Filter
+		c.Filter = &filter
+	}
+	if cfg.Matcher != nil {
+		matcher := *cfg.Matcher
+		c.Matcher = &matcher
+	}
+	if cfg.HTTP != nil {
+		http := *cfg.HTTP
+		http.Header = cloneStringMap(cfg.HTTP.Header)
+		http.RequestHeader = cloneStringMap(cfg.HTTP.RequestHeader)
+		http.ResponseHeader = cloneStringMap(cfg.HTTP.ResponseHeader)
+		http.Rewrite = append([]config.HTTPURLRewriteConfig(nil), cfg.HTTP.Rewrite...)
+		http.RewriteURL = append([]config.HTTPURLRewriteConfig(nil), cfg.HTTP.RewriteURL...)
+		http.RewriteBody = append([]config.HTTPBodyRewriteConfig(nil), cfg.HTTP.RewriteBody...)
+		http.RewriteRequestBody = append([]config.HTTPBodyRewriteConfig(nil), cfg.HTTP.RewriteRequestBody...)
+		http.RewriteResponseBody = append([]config.HTTPBodyRewriteConfig(nil), cfg.HTTP.RewriteResponseBody...)
+		http.RewriteRequestHeader = append([]config.HTTPHeaderRewriteConfig(nil), cfg.HTTP.RewriteRequestHeader...)
+		http.RewriteResponseHeader = append([]config.HTTPHeaderRewriteConfig(nil), cfg.HTTP.RewriteResponseHeader...)
+		http.Auth = cloneAuth(cfg.HTTP.Auth)
+		c.HTTP = &http
+	}
+	if cfg.TLS != nil {
+		tls := *cfg.TLS
+		if cfg.TLS.Options != nil {
+			options := *cfg.TLS.Options
+			options.CipherSuites = append([]string(nil), cfg.TLS.Options.CipherSuites...)
+			options.ALPN = append([]string(nil), cfg.TLS.Options.ALPN...)
+			tls.Options = &options
+		}
+		c.TLS = &tls
+	}
+	if cfg.Probe != nil {
+		probe := *cfg.Probe
+		probe.HTTPHeaders = cloneStringMap(cfg.Probe.HTTPHeaders)
+		c.Probe = &probe
+	}
+	return &c
+}
+
+func cloneAuth(cfg *config.AuthConfig) *config.AuthConfig {
+	if cfg == nil {
+		return nil
+	}
+	auth := *cfg
+	return &auth
+}
+
+func cloneTLSConfig(cfg *config.TLSConfig) *config.TLSConfig {
+	if cfg == nil {
+		return nil
+	}
+	tls := *cfg
+	tls.ServerNames = append([]string(nil), cfg.ServerNames...)
+	if cfg.Options != nil {
+		options := *cfg.Options
+		options.CipherSuites = append([]string(nil), cfg.Options.CipherSuites...)
+		options.ALPN = append([]string(nil), cfg.Options.ALPN...)
+		tls.Options = &options
+	}
+	return &tls
+}
+
+func cloneStringMap(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	c := make(map[string]string, len(m))
+	for k, v := range m {
+		c[k] = v
+	}
+	return c
+}
+
+// filterToMatcherRule converts a deprecated NodeFilterConfig (host/protocol/
+// path) into an equivalent matcher DSL rule. Empty fields are omitted; an
+// empty result means the node is unconditional. Path maps to PathPrefix
+// (the legacy filter is a prefix match, not exact).
+func filterToMatcherRule(filter *config.NodeFilterConfig) string {
+	if filter == nil {
+		return ""
+	}
+	var parts []string
+	// Normalize the legacy host forms first: `*.example.com` and
+	// `.example.com` both meant "apex AND subdomains" in the legacy filter.
+	// Strip the wildcard so the leading-dot branch below handles both.
+	host := filter.Host
+	if strings.HasPrefix(host, "*") {
+		host = host[1:]
+		if !strings.HasPrefix(host, ".") {
+			host = "." + host
+		}
+	}
+	if host != "" {
+		// A leading-dot host matches the apex AND its subdomains in the
+		// legacy filter (HasSuffix on the dot-stripped form), but matcher
+		// Host(.x) only matches subdomains. Emit both to preserve apex
+		// coverage. Parenthesize the OR when other conjuncts follow, since
+		// && binds tighter than || in the matcher DSL.
+		if strings.HasPrefix(host, ".") {
+			h := "Host(`" + host[1:] + "`) || Host(`" + host + "`)"
+			if filter.Protocol != "" || filter.Path != "" {
+				h = "(" + h + ")"
+			}
+			parts = append(parts, h)
+		} else {
+			parts = append(parts, "Host(`"+host+"`)")
+		}
+	}
+	if prot := filter.Protocol; prot != "" {
+		parts = append(parts, "Proto(`"+prot+"`)")
+	}
+	if path := filter.Path; path != "" {
+		parts = append(parts, "PathPrefix(`"+path+"`)")
+	}
+	return strings.Join(parts, " && ")
+}
+
+// ParseNode converts a NodeConfig into a *chain.Node. It resolves the
+// connector and dialer from their registries, applies TLS settings, extracts
+// metadata-driven options (so_mark, interface, netns, proxy protocol), sets up
+// bypass rules, node filters, HTTP settings, and TLS node settings. The hop
+// parameter is used only for logging context.
+
+func parseBodyRewrites(vs []config.HTTPBodyRewriteConfig, log logger.Logger) []chain.HTTPBodyRewriteSettings {
+	var out []chain.HTTPBodyRewriteSettings
+	for _, v := range vs {
+		var pattern *regexp.Regexp
+		var rewriteType string
+
+		js, ok := strings.CutPrefix(v.Match, "json:")
+		del := false
+		if !ok {
+			// json-:<path> deletes the matched JSON field instead of replacing it.
+			if js, ok = strings.CutPrefix(v.Match, "json-:"); ok {
+				del = true
+			}
+		}
+		if ok {
+			// json:<path>[=<value-regex>] or json-:<path>[=<value-regex>]
+			path, valRegex, _ := strings.Cut(js, "=")
+			if valRegex == "" {
+				valRegex = ".*"
+			}
+			var err error
+			pattern, err = regexp.Compile(valRegex)
+			if err != nil {
+				log.Warnf("invalid JSON value regex %q for path %q: %v", valRegex, path, err)
+				continue
+			}
+			if del {
+				rewriteType = "json-:" + path
+			} else {
+				rewriteType = "json:" + path
+			}
+		} else {
+			if v.Match != "" {
+				pattern, _ = regexp.Compile(v.Match)
+			}
+			rewriteType = v.Type
+		}
+
+		rw := chain.HTTPBodyRewriteSettings{
+			Type:         rewriteType,
+			Pattern:      pattern,
+			Replacement:  []byte(v.Replacement),
+			MaxChunkSize: v.MaxChunkSize,
+		}
+		if v.Rewriter != "" {
+			if !registry.RewriterRegistry().IsRegistered(v.Rewriter) {
+				log.Warnf("rewriter %q not found in registry for rewrite rule", v.Rewriter)
+			}
+			rw.Rewriter = registry.RewriterRegistry().Get(v.Rewriter)
+		}
+		if pattern != nil || rw.Rewriter != nil {
+			out = append(out, rw)
+		}
+	}
+	return out
+}
+
+func parseHeaderRewrites(vs []config.HTTPHeaderRewriteConfig, log logger.Logger) []chain.HTTPHeaderRewriteSettings {
+	var out []chain.HTTPHeaderRewriteSettings
+	for _, v := range vs {
+		var name, pattern *regexp.Regexp
+		if v.Name != "" {
+			name, _ = regexp.Compile(v.Name)
+		}
+		if v.Match != "" {
+			pattern, _ = regexp.Compile(v.Match)
+		}
+
+		rw := chain.HTTPHeaderRewriteSettings{
+			Name:        name,
+			Pattern:     pattern,
+			Replacement: []byte(v.Replacement),
+		}
+		if v.Rewriter != "" {
+			if !registry.RewriterRegistry().IsRegistered(v.Rewriter) {
+				log.Warnf("rewriter %q not found in registry for rewrite rule", v.Rewriter)
+			}
+			rw.Rewriter = registry.RewriterRegistry().Get(v.Rewriter)
+		}
+		// Gate on the config string, not the compiled regexp: regexp.Compile("")
+		// returns a non-nil match-all regexp, so an empty Name with no rewriter
+		// would otherwise become a silent no-op rule.
+		if v.Name != "" || rw.Rewriter != nil {
+			out = append(out, rw)
+		}
+	}
+	return out
+}
 
 func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.Node, error) {
 	if cfg == nil {
 		return nil, nil
 	}
 
-	if cfg.Connector == nil {
-		cfg.Connector = &config.ConnectorConfig{
-			Type: "http",
-		}
+	connCfg := cfg.Connector
+	if connCfg == nil {
+		connCfg = &config.ConnectorConfig{}
+	}
+	if connCfg.Type == "" {
+		connCfg.Type = "http"
 	}
 
-	if cfg.Dialer == nil {
-		cfg.Dialer = &config.DialerConfig{
-			Type: "tcp",
-		}
+	dialCfg := cfg.Dialer
+	if dialCfg == nil {
+		dialCfg = &config.DialerConfig{}
+	}
+	if dialCfg.Type == "" {
+		dialCfg.Type = "tcp"
 	}
 
 	nodeLogger := log.WithFields(map[string]any{
 		"hop":       hop,
 		"kind":      "node",
 		"node":      cfg.Name,
-		"connector": cfg.Connector.Type,
-		"dialer":    cfg.Dialer.Type,
+		"connector": connCfg.Type,
+		"dialer":    dialCfg.Type,
 	})
 
 	serverName, _, _ := net.SplitHostPort(cfg.Addr)
 
-	tlsCfg := cfg.Connector.TLS
+	tlsCfg := connCfg.TLS
 	if tlsCfg == nil {
 		tlsCfg = &config.TLSConfig{}
 	}
@@ -68,25 +378,22 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 		"kind": "connector",
 	})
 	var cr connector.Connector
-	if rf := registry.ConnectorRegistry().Get(cfg.Connector.Type); rf != nil {
+	if rf := registry.ConnectorRegistry().Get(connCfg.Type); rf != nil {
 		cr = rf(
-			connector.AuthOption(auth_parser.Info(cfg.Connector.Auth)),
+			connector.AuthOption(auth_parser.Info(connCfg.Auth)),
 			connector.TLSConfigOption(tlsConfig),
 			connector.LoggerOption(connectorLogger),
 		)
 	} else {
-		return nil, fmt.Errorf("unregistered connector: %s", cfg.Connector.Type)
+		return nil, fmt.Errorf("unregistered connector: %s", connCfg.Type)
 	}
 
-	if cfg.Connector.Metadata == nil {
-		cfg.Connector.Metadata = make(map[string]any)
-	}
-	if err := cr.Init(mdx.NewMetadata(cfg.Connector.Metadata)); err != nil {
+	if err := cr.Init(mdx.NewMetadata(connCfg.Metadata)); err != nil {
 		connectorLogger.Error("init: ", err)
 		return nil, err
 	}
 
-	tlsCfg = cfg.Dialer.TLS
+	tlsCfg = dialCfg.TLS
 	if tlsCfg == nil {
 		tlsCfg = &config.TLSConfig{}
 	}
@@ -106,21 +413,37 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 	})
 
 	var d dialer.Dialer
-	if rf := registry.DialerRegistry().Get(cfg.Dialer.Type); rf != nil {
+	if rf := registry.DialerRegistry().Get(dialCfg.Type); rf != nil {
 		d = rf(
-			dialer.AuthOption(auth_parser.Info(cfg.Dialer.Auth)),
+			dialer.AuthOption(auth_parser.Info(dialCfg.Auth)),
 			dialer.TLSConfigOption(tlsConfig),
 			dialer.LoggerOption(dialerLogger),
 			dialer.ProxyProtocolOption(mdutil.GetInt(md, parsing.MDKeyProxyProtocol)),
 		)
 	} else {
-		return nil, fmt.Errorf("unregistered dialer: %s", cfg.Dialer.Type)
+		return nil, fmt.Errorf("unregistered dialer: %s", dialCfg.Type)
 	}
 
-	if cfg.Dialer.Metadata == nil {
-		cfg.Dialer.Metadata = make(map[string]any)
+	// p2p: wrap the dialer so the node's base transport (the path to this
+	// node) goes through a tunnel opened by the named p2p plugin instead of
+	// a direct network dial. The inner dialer's protocol (tls/ws/mux) runs
+	// unchanged on top of the tunnel. Only whitelisted dialers qualify:
+	// the wrapper's contract is "inner dials one plain TCP stream via
+	// options.Dialer". The wrap happens before Init so the chain inits
+	// exactly once, through the wrapper.
+	if name := mdutil.GetString(md, parsing.MDKeyP2P); name != "" {
+		provider := registry.P2PRegistry().Get(name)
+		if provider == nil {
+			return nil, fmt.Errorf("unregistered p2p: %s", name)
+		}
+		if !xp2p.SupportedDialer(dialCfg.Type) {
+			return nil, fmt.Errorf("dialer %q does not support p2p", dialCfg.Type)
+		}
+		d = xp2p.NewTunnelDialer(d, provider,
+			xp2p.WithTunnelNetwork(mdutil.GetString(md, parsing.MDKeyP2PNetwork)))
 	}
-	if err := d.Init(mdx.NewMetadata(cfg.Dialer.Metadata)); err != nil {
+
+	if err := d.Init(mdx.NewMetadata(dialCfg.Metadata)); err != nil {
 		dialerLogger.Error("init: ", err)
 		return nil, err
 	}
@@ -142,49 +465,58 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 	opts := []chain.NodeOption{
 		chain.TransportNodeOption(tr),
 		chain.BypassNodeOption(xbypass.BypassGroup(bypass_parser.List(cfg.Bypass, cfg.Bypasses...)...)),
-		chain.ResoloverNodeOption(registry.ResolverRegistry().Get(cfg.Resolver)),
+		chain.ResolverNodeOption(registry.ResolverRegistry().Get(cfg.Resolver)),
 		chain.HostMapperNodeOption(registry.HostsRegistry().Get(cfg.Hosts)),
 		chain.MetadataNodeOption(md),
 		chain.NetworkNodeOption(cfg.Network),
 	}
 
-	if filter := cfg.Filter; filter != nil {
-		// convert *.example.com to .example.com
-		// convert *example.com to example.com
-		host := filter.Host
-		if strings.HasPrefix(host, "*") {
-			host = host[1:]
-			if !strings.HasPrefix(host, ".") {
-				host = "." + host
-			}
-		}
+	var (
+		rule     string
+		priority int
+		bodySize int
+	)
 
-		settings := &chain.NodeFilterSettings{
-			Protocol: filter.Protocol,
-			Host:     host,
-			Path:     filter.Path,
-		}
-		opts = append(opts, chain.NodeFilterOption(settings))
+	// Deprecated filter: normalize into an equivalent matcher DSL rule so the
+	// runtime keeps a single filtering logic. Explicit -1 priority opts out of
+	// auto-priority and the priority short-circuit, preserving the legacy
+	// filter behavior (always through the selector).
+	if filter := cfg.Filter; filter != nil {
+		rule = filterToMatcherRule(filter)
+		priority = -1
+		bodySize = DefaultMatcherBodySize
 	}
 
 	if cfg.Matcher != nil {
-		priority := cfg.Matcher.Priority
-
-		if rule := strings.TrimSpace(cfg.Matcher.Rule); rule != "" {
-			if matcher, err := routing.NewMatcher(rule); err == nil {
-				log.Debugf("new matcher for node %s with rule %s", cfg.Name, cfg.Matcher.Rule)
-				if priority == 0 {
-					priority = len(cfg.Matcher.Rule)
-				}
-				opts = append(opts, chain.MatcherNodeOption(matcher))
-			} else {
-				log.Error(err)
-				priority = -1
-			}
-		}
-
-		opts = append(opts, chain.PriorityNodeOption(priority))
+		priority = cfg.Matcher.Priority
+		rule = cfg.Matcher.Rule
+		bodySize = cfg.Matcher.BodySize
 	}
+
+	if rule = strings.TrimSpace(rule); rule != "" {
+		if matcher, err := routing.NewMatcher(rule); err == nil {
+			log.Debugf("new matcher for node %s with rule %s", cfg.Name, rule)
+			// Priority 0 means "use default": automatically set to the
+			// rule length so longer (more specific) rules outrank shorter
+			// ones. Use a negative priority to opt out of this behavior
+			// and always go through the selector.
+			if priority == 0 {
+				priority = len(rule)
+			}
+			opts = append(opts, chain.MatcherNodeOption(matcher))
+		} else {
+			log.Error(err)
+			priority = -1
+		}
+	}
+
+	if bodySize <= 0 {
+		bodySize = DefaultMatcherBodySize
+	} else if bodySize > MaxMatcherBodySize {
+		bodySize = MaxMatcherBodySize
+	}
+	opts = append(opts, chain.MatcherBodySizeNodeOption(bodySize))
+	opts = append(opts, chain.PriorityNodeOption(priority))
 
 	if cfg.HTTP != nil {
 		settings := &chain.HTTPNodeSettings{
@@ -194,6 +526,10 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 		}
 		if settings.RequestHeader == nil {
 			settings.RequestHeader = cfg.HTTP.Header
+		}
+
+		if v := cfg.HTTP.HostPattern; v != "" {
+			settings.HostPattern, _ = regexp.Compile(v)
 		}
 
 		if auth := cfg.HTTP.Auth; auth != nil && auth.Username != "" {
@@ -219,15 +555,16 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 				})
 			}
 		}
-		for _, v := range cfg.HTTP.RewriteBody {
-			if pattern, _ := regexp.Compile(v.Match); pattern != nil {
-				settings.RewriteResponseBody = append(settings.RewriteResponseBody, chain.HTTPBodyRewriteSettings{
-					Type:        v.Type,
-					Pattern:     pattern,
-					Replacement: []byte(v.Replacement),
-				})
-			}
+		settings.RewriteResponseBody = append(settings.RewriteResponseBody, parseBodyRewrites(cfg.HTTP.RewriteBody, log)...)
+		settings.RewriteResponseBody = append(settings.RewriteResponseBody, parseBodyRewrites(cfg.HTTP.RewriteResponseBody, log)...)
+		settings.RewriteRequestBody = append(settings.RewriteRequestBody, parseBodyRewrites(cfg.HTTP.RewriteRequestBody, log)...)
+		settings.RewriteRequestHeader = parseHeaderRewrites(cfg.HTTP.RewriteRequestHeader, log)
+		settings.RewriteResponseHeader = parseHeaderRewrites(cfg.HTTP.RewriteResponseHeader, log)
+
+		if v := strings.TrimSpace(cfg.HTTP.FailCodes); v != "" {
+			settings.FailCodes = parseFailCodes(v, nodeLogger)
 		}
+
 		opts = append(opts, chain.HTTPNodeOption(settings))
 	}
 
@@ -244,5 +581,70 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 		}
 		opts = append(opts, chain.TLSNodeOption(tlsCfg))
 	}
-	return chain.NewNode(cfg.Name, cfg.Addr, opts...), nil
+
+	node := chain.NewNode(cfg.Name, cfg.Addr, opts...)
+	if cfg.Probe != nil {
+		if pc := ParseProbeConfig(cfg.Probe); pc != nil {
+			xchain.StartNodeProbe(node, pc, nodeLogger)
+		}
+	}
+	return node, nil
+}
+
+// ParseProbeConfig converts a config.ProbeConfig into a chain.ProbeConfig.
+// Returns nil when the config is invalid (e.g. empty addr).
+func ParseProbeConfig(cfg *config.ProbeConfig) *chain.ProbeConfig {
+	if cfg == nil || (cfg.Addr == "" && cfg.Type != "cmd") {
+		return nil
+	}
+	if cfg.Type == "cmd" && cfg.Command == "" {
+		return nil
+	}
+	pt := chain.ProbeTypeTCP
+	switch cfg.Type {
+	case "http":
+		pt = chain.ProbeTypeHTTP
+	case "cmd":
+		pt = chain.ProbeTypeCmd
+	}
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return &chain.ProbeConfig{
+		Type:           pt,
+		Addr:           cfg.Addr,
+		Interval:       interval,
+		Timeout:        timeout,
+		HTTPPath:       cfg.HTTPPath,
+		HTTPHost:       cfg.HTTPHost,
+		HTTPHeaders:    cfg.HTTPHeaders,
+		ExpectedStatus: cfg.ExpectedStatus,
+		Command:        cfg.Command,
+	}
+}
+
+// parseFailCodes parses a comma-separated status code list, e.g. "429,5xx".
+// Tokens ending in "xx" become hundred-level wildcards (5xx → 5, matching
+// 500-599). Invalid tokens are logged and skipped.
+func parseFailCodes(s string, log logger.Logger) chain.FailCodes {
+	var codes chain.FailCodes
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if len(part) == 3 && strings.HasSuffix(part, "xx") {
+			if prefix, err := strconv.Atoi(part[:1]); err == nil && prefix > 0 {
+				codes = append(codes, prefix) // < 100 → wildcard
+				continue
+			}
+		} else if code, err := strconv.Atoi(part); err == nil && code >= 100 {
+			codes = append(codes, code)
+			continue
+		}
+		log.Warnf("failCodes: invalid token %q", part)
+	}
+	return codes
 }

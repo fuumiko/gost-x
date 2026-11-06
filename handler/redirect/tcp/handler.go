@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -34,10 +35,11 @@ func init() {
 }
 
 type redirectHandler struct {
-	md       metadata
-	options  handler.Options
-	recorder recorder.RecorderObject
-	certPool tls_util.CertPool
+	md              metadata
+	options         handler.Options
+	recorder        recorder.RecorderObject
+	sessionRecorder *xrecorder.SessionRecorder
+	certPool        tls_util.CertPool
 }
 
 func NewHandler(opts ...handler.Option) handler.Handler {
@@ -62,6 +64,10 @@ func (h *redirectHandler) Init(md md.Metadata) (err error) {
 			break
 		}
 	}
+
+	h.sessionRecorder = xrecorder.NewSessionRecorder(h.recorder.Recorder, xrecorder.SessionRecorderOptions{
+		Period: h.md.recorderPeriod,
+	})
 
 	if h.md.certificate != nil && h.md.privateKey != nil {
 		h.certPool = tls_util.NewMemoryCertPool()
@@ -100,6 +106,9 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 	pStats := xstats.Stats{}
 	conn = stats_wrapper.WrapConn(conn, &pStats)
 
+	session := h.sessionRecorder.NewSession(ctx, &pStats)
+	ctx = ictx.ContextWithSession(ctx, session)
+
 	defer func() {
 		if err != nil {
 			ro.Err = err.Error()
@@ -107,7 +116,7 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 		ro.InputBytes = pStats.Get(stats.KindInputBytes)
 		ro.OutputBytes = pStats.Get(stats.KindOutputBytes)
 		ro.Duration = time.Since(start)
-		if err := ro.Record(ctx, h.recorder.Recorder); err != nil {
+		if err := session.Finish(ctx, *ro); err != nil {
 			log.Errorf("record: %v", err)
 		}
 
@@ -141,6 +150,18 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 		"dst":  dstAddr.String(),
 		"host": dstAddr.String(),
 	})
+
+	// Check bypass on dstAddr before sniffing — the sniffer only matches the
+	// sniffed req.Host, so IP/CIDR rules miss connections carrying a hostname.
+	// Skip in whitelist mode: a domain-only allowlist never matches the bare
+	// destination IP, and rejecting here would kill sniffed-host decisions
+	// (e.g. example.com in the whitelist) before sniffing can run.
+	if h.options.Bypass != nil &&
+		!h.options.Bypass.IsWhitelist() &&
+		h.options.Bypass.Contains(ctx, dstAddr.Network(), dstAddr.String(), bypass.WithService(h.options.Service)) {
+		log.Debug("bypass: ", dstAddr)
+		return xbypass.ErrBypass
+	}
 
 	if h.md.sniffing {
 		if h.md.sniffingTimeout > 0 {
@@ -187,6 +208,18 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 
 			return cc, err
 		}
+
+		// Dial the original dst instead of the sniffed host; sniffing's
+		// hostname bypass and recording still run beforehand.
+		if h.md.sniffingDialOriginalDst {
+			dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+				var buf bytes.Buffer
+				cc, err := h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &buf), "tcp", dstAddr.String())
+				ro.Route = buf.String()
+				return cc, err
+			}
+		}
+
 		dialTLS := func(ctx context.Context, network, address string, cfg *tls.Config) (net.Conn, error) {
 			return dial(ctx, network, address)
 		}
@@ -195,6 +228,7 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 			Websocket:           h.md.sniffingWebsocket,
 			WebsocketSampleRate: h.md.sniffingWebsocketSampleRate,
 			Recorder:            h.recorder.Recorder,
+			SessionRecorder:     h.sessionRecorder,
 			RecorderOptions:     h.recorder.Options,
 			Certificate:         h.md.certificate,
 			PrivateKey:          h.md.privateKey,
@@ -204,10 +238,18 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 			ReadTimeout:         h.md.readTimeout,
 		}
 
-		conn = xnet.NewReadWriteConn(br, conn, conn)
+		// Capture bytes consumed by the sniffer so we can replay
+		// them when sniffingFallback is enabled.
+		origConn := conn
+		capture := new(bytes.Buffer)
+		sniffConn := xnet.NewReadWriteConn(io.TeeReader(br, capture), origConn, origConn)
+
+		var sniffErr error
+		var handled bool
 		switch proto {
 		case sniffing.ProtoHTTP:
-			return sniffer.HandleHTTP(ctx, "tcp", conn,
+			handled = true
+			sniffErr = sniffer.HandleHTTP(ctx, "tcp", sniffConn,
 				sniffing.WithService(h.options.Service),
 				sniffing.WithDial(dial),
 				sniffing.WithDialTLS(dialTLS),
@@ -215,8 +257,13 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 				sniffing.WithRecorderObject(ro),
 				sniffing.WithLog(log),
 			)
+			if sniffErr == nil {
+				ro.Time = time.Time{}
+				return nil
+			}
 		case sniffing.ProtoTLS:
-			return sniffer.HandleTLS(ctx, ro.Network, conn,
+			handled = true
+			sniffErr = sniffer.HandleTLS(ctx, ro.Network, sniffConn,
 				sniffing.WithService(h.options.Service),
 				sniffing.WithDial(dial),
 				sniffing.WithDialTLS(dialTLS),
@@ -224,16 +271,40 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 				sniffing.WithRecorderObject(ro),
 				sniffing.WithLog(log),
 			)
+			if sniffErr == nil {
+				return nil
+			}
 		}
+
+		// A protocol the sniffer does not classify (ssh, redis, or "" when
+		// nothing arrives within sniffing.timeout) has no error to report and
+		// nothing to fall back from, so it always reaches raw forwarding to the
+		// original dstAddr — the way every non-HTTP/TLS protocol was handled
+		// before sniffing gained a failure path. sniffing.fallback only governs
+		// what happens after HTTP/TLS handling itself fails (e.g. an empty SNI,
+		// gost#891).
+		if !handled {
+			log.Debugf("sniffing: protocol %q not handled, forwarding raw", proto)
+		} else if h.md.sniffingFallback {
+			log.Debugf("sniffing(%s) failed, falling back: %v", proto, sniffErr)
+		} else {
+			return sniffErr
+		}
+		conn = xnet.NewReadWriteConn(io.MultiReader(capture, br), origConn, origConn)
+		// fall through to raw forwarding below
 	}
 
-	log.Debugf("%s >> %s", conn.RemoteAddr(), dstAddr)
-
+	// Re-check bypass on dstAddr before raw forwarding. In whitelist mode the
+	// pre-sniffing check above is skipped, so this is what drops connections
+	// whose sniffed host didn't match (sniffingFallback) or that weren't
+	// sniffed at all (sniffing disabled).
 	if h.options.Bypass != nil &&
 		h.options.Bypass.Contains(ctx, dstAddr.Network(), dstAddr.String(), bypass.WithService(h.options.Service)) {
 		log.Debug("bypass: ", dstAddr)
 		return xbypass.ErrBypass
 	}
+
+	log.Debugf("%s >> %s", conn.RemoteAddr(), dstAddr)
 
 	var buf bytes.Buffer
 	cc, err := h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &buf), dstAddr.Network(), dstAddr.String())
@@ -247,6 +318,8 @@ func (h *redirectHandler) Handle(ctx context.Context, conn net.Conn, opts ...han
 	log = log.WithFields(map[string]any{"src": cc.LocalAddr().String(), "dst": cc.RemoteAddr().String()})
 	ro.SrcAddr = cc.LocalAddr().String()
 	ro.DstAddr = cc.RemoteAddr().String()
+
+	session.Start(*ro)
 
 	t := time.Now()
 	log.Infof("%s <-> %s", conn.RemoteAddr(), dstAddr)
@@ -270,3 +343,5 @@ func (h *redirectHandler) checkRateLimit(addr net.Addr) bool {
 
 	return true
 }
+
+func (h *redirectHandler) Close() error { return h.sessionRecorder.Close() }

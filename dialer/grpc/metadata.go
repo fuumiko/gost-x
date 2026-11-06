@@ -4,6 +4,7 @@ import (
 	"time"
 
 	mdata "github.com/go-gost/core/metadata"
+	"github.com/go-gost/x/internal/util/ech"
 	mdutil "github.com/go-gost/x/metadata/util"
 )
 
@@ -16,6 +17,13 @@ type metadata struct {
 	keepaliveTimeout             time.Duration
 	keepalivePermitWithoutStream bool
 	minConnectTimeout            time.Duration
+
+	tcpKeepalive         bool
+	tcpKeepaliveIdle     time.Duration
+	tcpKeepaliveInterval time.Duration
+	tcpKeepaliveCount    int
+
+	ech ech.Config
 }
 
 func (d *grpcDialer) parseMetadata(md mdata.Metadata) (err error) {
@@ -38,6 +46,13 @@ func (d *grpcDialer) parseMetadata(md mdata.Metadata) (err error) {
 	if d.md.minConnectTimeout <= 0 {
 		d.md.minConnectTimeout = 30 * time.Second
 	}
+
+	d.md.tcpKeepalive = mdutil.GetBool(md, "tcp.keepalive")
+	d.md.tcpKeepaliveIdle = mdutil.GetDuration(md, "tcp.keepalive.idle")
+	d.md.tcpKeepaliveInterval = mdutil.GetDuration(md, "tcp.keepalive.interval")
+	d.md.tcpKeepaliveCount = mdutil.GetInt(md, "tcp.keepalive.count")
+
+	d.md.ech = ech.FromMetadata(md)
 
 	return
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/go-gost/core/recorder"
 	"github.com/go-gost/gosocks5"
 	xctx "github.com/go-gost/x/ctx"
+	ictx "github.com/go-gost/x/internal/ctx"
 	"github.com/go-gost/x/internal/util/socks"
 	stats_util "github.com/go-gost/x/internal/util/stats"
 	tls_util "github.com/go-gost/x/internal/util/tls"
@@ -36,14 +37,15 @@ func init() {
 }
 
 type socks5Handler struct {
-	selector gosocks5.Selector
-	md       metadata
-	options  handler.Options
-	stats    *stats_util.HandlerStats
-	limiter  traffic.TrafficLimiter
-	cancel   context.CancelFunc
-	recorder recorder.RecorderObject
-	certPool tls_util.CertPool
+	selector        gosocks5.Selector
+	md              metadata
+	options         handler.Options
+	stats           *stats_util.HandlerStats
+	limiter         traffic.TrafficLimiter
+	cancel          context.CancelFunc
+	recorder        recorder.RecorderObject
+	sessionRecorder *xrecorder.SessionRecorder
+	certPool        tls_util.CertPool
 }
 
 func NewHandler(opts ...handler.Option) handler.Handler {
@@ -93,11 +95,35 @@ func (h *socks5Handler) Init(md md.Metadata) (err error) {
 		}
 	}
 
+	h.sessionRecorder = xrecorder.NewSessionRecorder(h.recorder.Recorder, xrecorder.SessionRecorderOptions{
+		Period: h.md.recorderPeriod,
+	})
+
 	if h.md.certificate != nil && h.md.privateKey != nil {
 		h.certPool = tls_util.NewMemoryCertPool()
 	}
 
 	return
+}
+
+// networkAddr derives the network string from the SOCKS5 address type.
+// For IPv4 addresses it returns "tcp4"/"udp4" to prevent dual-stack
+// (IPv4-mapped-IPv6) socket creation on Linux, which would cause the
+// listener to bind on [::]:port instead of 0.0.0.0:port.
+// For IPv6 addresses it returns "tcp6"/"udp6".
+// For domain addresses it returns the unmodified network.
+func networkAddr(network string, addr *gosocks5.Addr) string {
+	if addr == nil {
+		return network
+	}
+	switch addr.Type {
+	case gosocks5.AddrIPv4:
+		return network + "4"
+	case gosocks5.AddrIPv6:
+		return network + "6"
+	default:
+		return network
+	}
 }
 
 func (h *socks5Handler) Handle(ctx context.Context, conn net.Conn, opts ...handler.HandleOption) (err error) {
@@ -130,6 +156,9 @@ func (h *socks5Handler) Handle(ctx context.Context, conn net.Conn, opts ...handl
 	pStats := xstats.Stats{}
 	conn = stats_wrapper.WrapConn(conn, &pStats)
 
+	session := h.sessionRecorder.NewSession(ctx, &pStats)
+	ctx = ictx.ContextWithSession(ctx, session)
+
 	defer func() {
 		if err != nil {
 			ro.Err = err.Error()
@@ -137,7 +166,7 @@ func (h *socks5Handler) Handle(ctx context.Context, conn net.Conn, opts ...handl
 		ro.InputBytes += pStats.Get(stats.KindInputBytes)
 		ro.OutputBytes += pStats.Get(stats.KindOutputBytes)
 		ro.Duration = time.Since(start)
-		if err := ro.Record(ctx, h.recorder.Recorder); err != nil {
+		if err := session.Finish(ctx, *ro); err != nil {
 			log.Errorf("record: %v", err)
 		}
 
@@ -179,15 +208,19 @@ func (h *socks5Handler) Handle(ctx context.Context, conn net.Conn, opts ...handl
 	case gosocks5.CmdConnect:
 		return h.handleConnect(ctx, conn, "tcp", address, ro, log)
 	case gosocks5.CmdBind:
-		return h.handleBind(ctx, conn, "tcp", address, ro, log)
+		return h.handleBind(ctx, conn, networkAddr("tcp", req.Addr), address, ro, log)
 	case socks.CmdMuxBind:
-		return h.handleMuxBind(ctx, conn, "tcp", address, ro, log)
+		return h.handleMuxBind(ctx, conn, networkAddr("tcp", req.Addr), address, ro, log)
 	case gosocks5.CmdUdp:
 		ro.Network = "udp"
-		return h.handleUDP(ctx, conn, "udp", ro, log)
+		return h.handleUDP(ctx, conn, "udp", ro, &pStats, log)
 	case socks.CmdUDPTun:
 		ro.Network = "udp"
-		return h.handleUDPTun(ctx, conn, "udp", address, ro, log)
+		return h.handleUDPTun(ctx, conn, networkAddr("udp", req.Addr), address, ro, log)
+	case socks.CmdResolve:
+		return h.handleResolve(ctx, conn, address, log)
+	case socks.CmdResolvePTR:
+		return h.handleResolvePTR(ctx, conn, address, log)
 	default:
 		err = ErrUnknownCmd
 		log.Error(err)
@@ -202,7 +235,7 @@ func (h *socks5Handler) Close() error {
 	if h.cancel != nil {
 		h.cancel()
 	}
-	return nil
+	return h.sessionRecorder.Close()
 }
 
 func (h *socks5Handler) checkRateLimit(addr net.Addr) bool {
@@ -230,17 +263,21 @@ func (h *socks5Handler) observeStats(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
+			// Try to flush any buffered events from a previous failed attempt.
 			if len(events) > 0 {
-				if err := h.options.Observer.Observe(ctx, events); err == nil {
-					events = nil
+				if err := h.options.Observer.Observe(ctx, events); err != nil {
+					continue
 				}
-				break
 			}
 
-			evs := h.stats.Events()
-			if err := h.options.Observer.Observe(ctx, evs); err != nil {
-				events = evs
+			// Collect and send fresh events.
+			if evs := h.stats.Events(); len(evs) > 0 {
+				if err := h.options.Observer.Observe(ctx, evs); err != nil {
+					events = evs
+					continue
+				}
 			}
+			events = nil
 
 		case <-ctx.Done():
 			return

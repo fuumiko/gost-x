@@ -27,6 +27,35 @@ var (
 	magicHeader = []byte("GOST")
 )
 
+// firstInboundTimeout bounds the wait for the first inbound byte when no
+// keepalive period is configured. A hub that never answers — not started,
+// or silently refusing — would otherwise leave the spoke "running" forever
+// on a link that will never deliver. Expiring makes the caller redial and
+// re-register, which is also how a fixed hub recovers on its own. On a
+// socket dial any inbound byte clears it, from then on the link has proven
+// itself alive; a p2p dial instead turns it into the rolling bound below,
+// because its link can silently outlive the far side's session.
+// A variable, not a constant, so tests can shrink the wait.
+var firstInboundTimeout = 30 * time.Second
+
+// p2pInboundTimeout bounds the silence on a p2p dial once the first inbound
+// byte has proved the link alive. The registration handshake repeats every
+// p2pRegisterInterval and the hub echoes each one back over the same stream,
+// so ongoing silence means the hub stopped answering this dial: its session
+// was rebuilt and this stream is a zombie (2026-10-17: 17 minutes of two-way
+// blackhole while both ends read the path up), or the route was reclaimed.
+// Nothing else ends such a dial — writes succeed into the void and no
+// transport reports an error — so a rolling no-inbound bound is the only
+// signal. Ending it makes the caller redial, and the redial is what
+// re-registers and heals a hub-side rebuild. Three missed echoes at the
+// default 10s cadence. A variable, not a constant, so tests can shrink it.
+var p2pInboundTimeout = 30 * time.Second
+
+// p2pRegisterInterval is how often a p2p dial re-sends the registration
+// handshake when no keepalive period is configured. A variable, not a
+// constant, so tests can shrink the wait (same as firstInboundTimeout).
+var p2pRegisterInterval = defaultKeepAlivePeriod
+
 func (h *tunHandler) handleClient(ctx context.Context, conn net.Conn, network string, raddr string, config *tun_util.Config, log logger.Logger) error {
 	var ips []net.IP
 	for _, net := range config.Net {
@@ -44,14 +73,31 @@ func (h *tunHandler) handleClient(ctx context.Context, conn net.Conn, network st
 			}
 			defer cc.Close()
 
-			if network == "udp" {
-				ctx, cancel := context.WithCancel(ctx)
-				defer cancel()
+			// The registration handshake always runs. It is how the far side's
+			// tun server learns which addresses this device holds, and it is
+			// the only thing that tells it — a server routes by destination
+			// address, and this is the sole source of that mapping. Without it
+			// the link is one-way: traffic leaves, and nothing can come back.
+			//
+			// A configured keepalive period decides how often the handshake
+			// repeats, which matters against a server reached over UDP:
+			// UDP is connectionless, so silence is the only signal that a peer
+			// has left, and a repeat is what lets a route expire. A p2p dial
+			// needs the repeat for a reason UDP does not have: its stream
+			// outlives the peer session under it, so the far side can reclaim
+			// the route to this device while the dial still reads as alive —
+			// and then every return packet is dropped for want of it, at both
+			// ends silently. keepalive() therefore refreshes on a p2p dial
+			// even without a period configured (see p2pRegisterInterval),
+			// and that refresh cuts both ways: the hub's echo of it is this
+			// side's proof the route is real, so a hub that stopped answering
+			// ends the dial on p2pInboundTimeout instead of leaving it mute.
+			iterCtx, iterCancel := context.WithCancel(ctx)
+			defer iterCancel()
 
-				go h.keepalive(ctx, cc, ips)
-			}
+			go h.keepalive(iterCtx, cc, ips, network)
 
-			return h.transportClient(ctx, conn, cc, log)
+			return h.transportClient(ctx, conn, cc, network == "ip", log)
 		}()
 		if errors.Is(err, ErrTun) {
 			return err
@@ -62,7 +108,7 @@ func (h *tunHandler) handleClient(ctx context.Context, conn net.Conn, network st
 	}
 }
 
-func (h *tunHandler) keepalive(ctx context.Context, conn net.Conn, ips []net.IP) {
+func (h *tunHandler) keepalive(ctx context.Context, conn net.Conn, ips []net.IP, network string) {
 	// handshake
 	keepAliveData := bufpool.Get(keepAliveHeaderLength + len(ips)*net.IPv6len)
 	defer bufpool.Put(keepAliveData)
@@ -78,12 +124,27 @@ func (h *tunHandler) keepalive(ctx context.Context, conn net.Conn, ips []net.IP)
 		return
 	}
 
-	if h.md.keepAlivePeriod <= 0 {
-		return
+	period := h.md.keepAlivePeriod
+	if period <= 0 {
+		if network != "ip" {
+			// A socket dial's own transport reports the far side gone, so a
+			// one-shot handshake is the whole of it there.
+			return
+		}
+		// A p2p dial (network "ip": a bare peer key, not an address) has no
+		// such signal: its stream is kept across a peer session rebuild, so
+		// the far side can drop the route to this device under a dial that
+		// still reads as alive. Repeating the handshake is the only thing
+		// that puts the address back, so do it on a fixed interval.
+		period = p2pRegisterInterval
+		if period <= 0 {
+			return
+		}
+	} else {
+		conn.SetReadDeadline(time.Now().Add(period * 3))
 	}
-	conn.SetReadDeadline(time.Now().Add(h.md.keepAlivePeriod * 3))
 
-	ticker := time.NewTicker(h.md.keepAlivePeriod)
+	ticker := time.NewTicker(period)
 	defer ticker.Stop()
 
 	for {
@@ -92,26 +153,46 @@ func (h *tunHandler) keepalive(ctx context.Context, conn net.Conn, ips []net.IP)
 			if _, err := conn.Write(keepAliveData); err != nil {
 				return
 			}
-			h.options.Logger.Debugf("keepalive sended")
+			if h.md.keepAlivePeriod > 0 {
+				h.options.Logger.Debugf("keepalive sended")
+			} else {
+				// Not the configured keepalive but the p2p registration
+				// refresh: trace, so a line every interval cannot bury the
+				// events a diagnosis needs.
+				h.options.Logger.Tracef("registration refreshed")
+			}
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (h *tunHandler) transportClient(ctx context.Context, tun io.ReadWriter, conn net.Conn, log logger.Logger) error {
+func (h *tunHandler) transportClient(ctx context.Context, tun io.ReadWriter, conn net.Conn, p2p bool, log logger.Logger) error {
+	c, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	errc := make(chan error, 2)
 
 	go func() {
 		var b [MaxMessageSize]byte
 		for {
+			select {
+			case <-c.Done():
+				errc <- c.Err()
+				return
+			default:
+			}
+
 			err := func() error {
 				n, err := tun.Read(b[:])
 				if err != nil {
-					return fmt.Errorf("%w: read: %s", ErrTun, err.Error())
+					// %w, not %s: a device closed under the reader must stay
+					// recognisable as a closed device, or an intentional stop
+					// reads as a failure all the way up.
+					return fmt.Errorf("%w: read: %w", ErrTun, err)
 				}
 
-				if waterutil.IsIPv4(b[:n]) {
+				if tun_util.IPv4Packet(b[:n]) {
 					header, err := ipv4.ParseHeader(b[:n])
 					if err != nil {
 						log.Warn(err)
@@ -123,7 +204,7 @@ func (h *tunHandler) transportClient(ctx context.Context, tun io.ReadWriter, con
 							header.Src, header.Dst, xip.Protocol(waterutil.IPv4Protocol(b[:n])),
 							header.Len, header.TotalLen, header.ID, header.Flags)
 					}
-				} else if waterutil.IsIPv6(b[:n]) {
+				} else if tun_util.IPv6Packet(b[:n]) {
 					header, err := ipv6.ParseHeader(b[:n])
 					if err != nil {
 						log.Warn(err)
@@ -154,24 +235,78 @@ func (h *tunHandler) transportClient(ctx context.Context, tun io.ReadWriter, con
 
 	go func() {
 		var b [MaxMessageSize]byte
+		// The wait for the first inbound byte is bounded even without a
+		// keepalive period (the tun entrypoint configures none): silence
+		// means the far side never answered the handshake, and waiting
+		// forever is exactly the silent-"running" this guards against. With
+		// a period the window matches the handshake's own 3×period; without
+		// one the fixed one-shot applies until the first inbound clears it.
+		// On a p2p dial that first byte re-arms the bound instead of
+		// clearing it (p2pInboundTimeout): its stream can silently outlive
+		// the hub-side session under it, so ongoing silence has to end the
+		// dial. (keepalive() sets the same 3×period deadline for its path;
+		// the two agree, and this one is what the read loop below relies on.)
+		oneShot := h.md.keepAlivePeriod <= 0
+		if oneShot {
+			conn.SetReadDeadline(time.Now().Add(firstInboundTimeout))
+		} else {
+			conn.SetReadDeadline(time.Now().Add(h.md.keepAlivePeriod * 3))
+		}
 		for {
+			select {
+			case <-c.Done():
+				errc <- c.Err()
+				return
+			default:
+			}
+
 			err := func() error {
 				n, err := conn.Read(b[:])
 				if err != nil {
 					return err
 				}
 
-				if n == keepAliveHeaderLength && bytes.Equal(b[:4], magicHeader) {
-					ip := net.IP(b[4:20])
-					log.Debugf("keepalive received at %v", ip)
+				// Any inbound byte proves the tunnel is alive: refresh the liveness
+				// deadline before interpreting the packet. Relying on the keepalive
+				// echo alone (which a transient channel hiccup can drop) would redial
+				// a healthy tunnel after 3×period.
+				if h.md.keepAlivePeriod > 0 {
+					conn.SetReadDeadline(time.Now().Add(h.md.keepAlivePeriod * 3))
+				} else if p2p {
+					// A p2p dial keeps the bound rolling for its whole life.
+					// The registration refresh is echoed by the hub while the
+					// route to this device is real, so silence past
+					// p2pInboundTimeout means the echo stopped: the hub-side
+					// session under this dial was rebuilt and the stream is a
+					// zombie, or the route was reclaimed. Nothing else ends
+					// such a dial, and ending it is the whole cure — the
+					// caller redials and re-registers (see handleClient).
+					conn.SetReadDeadline(time.Now().Add(p2pInboundTimeout))
+				} else if oneShot {
+					// The one-shot has served: the link proved itself alive,
+					// so clear it and read without a deadline from here on,
+					// exactly as before this change.
+					oneShot = false
+					conn.SetReadDeadline(time.Time{})
+				}
 
-					if h.md.keepAlivePeriod > 0 {
-						conn.SetReadDeadline(time.Now().Add(h.md.keepAlivePeriod * 3))
+				// A registration handshake or keepalive echo is protocol, not a
+				// packet, so it never belongs on the device. The client does not
+				// route by address — only the hub reads it, on its own side.
+				// Without this guard a 20+N*16-byte registration frame from the
+				// peer is misread as IPv4 ('G' is 0x47) and gets written into
+				// the kernel device as junk. The hub and the socket server
+				// already filter this shape; the client must too.
+				if n >= keepAliveHeaderLength && bytes.Equal(b[:4], magicHeader) {
+					if n == keepAliveHeaderLength {
+						log.Debugf("keepalive received at %v", net.IP(b[4:20]))
+					} else {
+						log.Debugf("keepalive frame (%d bytes, %d address(es)) discarded", n, (n-keepAliveHeaderLength)/net.IPv6len)
 					}
 					return nil
 				}
 
-				if waterutil.IsIPv4(b[:n]) {
+				if tun_util.IPv4Packet(b[:n]) {
 					header, err := ipv4.ParseHeader(b[:n])
 					if err != nil {
 						log.Warn(err)
@@ -183,7 +318,7 @@ func (h *tunHandler) transportClient(ctx context.Context, tun io.ReadWriter, con
 							header.Src, header.Dst, xip.Protocol(waterutil.IPv4Protocol(b[:n])),
 							header.Len, header.TotalLen, header.ID, header.Flags)
 					}
-				} else if waterutil.IsIPv6(b[:n]) {
+				} else if tun_util.IPv6Packet(b[:n]) {
 					header, err := ipv6.ParseHeader(b[:n])
 					if err != nil {
 						log.Warn(err)
@@ -214,14 +349,5 @@ func (h *tunHandler) transportClient(ctx context.Context, tun io.ReadWriter, con
 		}
 	}()
 
-	select {
-	case err := <-errc:
-		if err != nil && err == io.EOF {
-			err = nil
-		}
-		return err
-
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return collectFirstError(errc, cancel)
 }

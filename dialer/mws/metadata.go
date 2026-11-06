@@ -5,8 +5,9 @@ import (
 	"time"
 
 	mdata "github.com/go-gost/core/metadata"
-	mdutil "github.com/go-gost/x/metadata/util"
+	"github.com/go-gost/x/internal/util/ech"
 	"github.com/go-gost/x/internal/util/mux"
+	mdutil "github.com/go-gost/x/metadata/util"
 )
 
 const (
@@ -27,6 +28,13 @@ type metadata struct {
 	header            http.Header
 	keepaliveInterval time.Duration
 	muxCfg            *mux.Config
+
+	tcpKeepalive         bool
+	tcpKeepaliveIdle     time.Duration
+	tcpKeepaliveInterval time.Duration
+	tcpKeepaliveCount    int
+
+	ech ech.Config
 }
 
 func (d *mwsDialer) parseMetadata(md mdata.Metadata) (err error) {
@@ -44,6 +52,8 @@ func (d *mwsDialer) parseMetadata(md mdata.Metadata) (err error) {
 		MaxFrameSize:      mdutil.GetInt(md, "mux.maxFrameSize"),
 		MaxReceiveBuffer:  mdutil.GetInt(md, "mux.maxReceiveBuffer"),
 		MaxStreamBuffer:   mdutil.GetInt(md, "mux.maxStreamBuffer"),
+		Type:              mdutil.GetString(md, "mux.type"),
+		MaxStreamWindow:   mdutil.GetInt(md, "mux.maxStreamWindow"),
 	}
 
 	d.md.handshakeTimeout = mdutil.GetDuration(md, "ws.handshakeTimeout", "handshakeTimeout")
@@ -66,6 +76,13 @@ func (d *mwsDialer) parseMetadata(md mdata.Metadata) (err error) {
 			d.md.keepaliveInterval = defaultKeepalivePeriod
 		}
 	}
+
+	d.md.tcpKeepalive = mdutil.GetBool(md, "tcp.keepalive")
+	d.md.tcpKeepaliveIdle = mdutil.GetDuration(md, "tcp.keepalive.idle")
+	d.md.tcpKeepaliveInterval = mdutil.GetDuration(md, "tcp.keepalive.interval")
+	d.md.tcpKeepaliveCount = mdutil.GetInt(md, "tcp.keepalive.count")
+
+	d.md.ech = ech.FromMetadata(md)
 
 	return
 }

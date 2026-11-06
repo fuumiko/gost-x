@@ -9,17 +9,25 @@ import (
 	"github.com/go-gost/core/resolver"
 	"github.com/go-gost/x/config"
 	"github.com/go-gost/x/internal/plugin"
+	xplugin "github.com/go-gost/x/plugin"
 	"github.com/go-gost/x/registry"
 	xresolver "github.com/go-gost/x/resolver"
 	resolver_plugin "github.com/go-gost/x/resolver/plugin"
 )
 
+// ParseResolver converts a ResolverConfig into a resolver.Resolver. It
+// supports plugin backends (HTTP or gRPC) and inline nameserver definitions
+// with optional chain-based upstream routing, TTL, timeout, and
+// prefer/async/only settings. Returns nil with no error when cfg is nil.
 func ParseResolver(cfg *config.ResolverConfig) (resolver.Resolver, error) {
 	if cfg == nil {
 		return nil, nil
 	}
 
 	if cfg.Plugin != nil {
+		if err := xplugin.Spawn(cfg.Plugin.Command); err != nil {
+			logger.Default().Errorf("spawn plugin %s: %v", cfg.Name, err)
+		}
 		var tlsCfg *tls.Config
 		if cfg.Plugin.TLS != nil {
 			tlsCfg = &tls.Config{
@@ -31,6 +39,7 @@ func ParseResolver(cfg *config.ResolverConfig) (resolver.Resolver, error) {
 		case "http":
 			return resolver_plugin.NewHTTPPlugin(
 				cfg.Name, cfg.Plugin.Addr,
+				plugin.TokenOption(cfg.Plugin.Token),
 				plugin.TLSConfigOption(tlsCfg),
 				plugin.TimeoutOption(cfg.Plugin.Timeout),
 			), nil

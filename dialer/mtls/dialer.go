@@ -3,7 +3,6 @@ package mtls
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"net"
 	"sync"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
 	xctx "github.com/go-gost/x/ctx"
+	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/net/proxyproto"
 	"github.com/go-gost/x/internal/util/mux"
 	"github.com/go-gost/x/registry"
@@ -47,7 +47,7 @@ func (d *mtlsDialer) Init(md md.Metadata) (err error) {
 		return
 	}
 
-	return nil
+	return d.md.ech.Init(d.logger, d.options.TLSConfig)
 }
 
 // Multiplex implements dialer.Multiplexer interface.
@@ -61,7 +61,17 @@ func (d *mtlsDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 
 	session, ok := d.sessions[addr]
 	if session != nil && session.IsClosed() {
-		delete(d.sessions, addr) // session is dead
+		// A session still waiting for its handshake is not dead: its conn
+		// belongs to the request that dialed it, whose Handshake either
+		// builds the session on it or closes it. Only an established
+		// session's base conn is closed here.
+		if session.session != nil {
+			session.Close()
+			if session.conn != nil {
+				session.conn.Close() // base conn would otherwise leak (and hold a p2p tunnel open)
+			}
+		}
+		delete(d.sessions, addr)
 		ok = false
 	}
 	if !ok {
@@ -73,6 +83,15 @@ func (d *mtlsDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 		conn, err = options.Dialer.Dial(ctx, "tcp", addr)
 		if err != nil {
 			return
+		}
+
+		if d.md.keepalive {
+			xnet.ApplyKeepalive(conn, net.KeepAliveConfig{
+				Enable:   true,
+				Idle:     d.md.keepaliveIdle,
+				Interval: d.md.keepaliveInterval,
+				Count:    d.md.keepaliveCount,
+			})
 		}
 
 		conn = proxyproto.WrapClientConn(
@@ -105,8 +124,15 @@ func (d *mtlsDialer) Handshake(ctx context.Context, conn net.Conn, options ...di
 
 	session, ok := d.sessions[opts.Addr]
 	if session != nil && session.conn != conn {
-		conn.Close()
-		return nil, errors.New("mtls: unrecognized connection")
+		// Another Dial registered a conn of its own while this one waited
+		// for the lock. If it has become a live session, use that and drop
+		// this conn; otherwise build the session on this conn, and the other
+		// request's Handshake will find it here and use it.
+		if session.IsClosed() {
+			ok = false
+		} else {
+			conn.Close()
+		}
 	}
 
 	if !ok || session.session == nil {
@@ -131,8 +157,20 @@ func (d *mtlsDialer) Handshake(ctx context.Context, conn net.Conn, options ...di
 }
 
 func (d *mtlsDialer) initSession(ctx context.Context, conn net.Conn) (*muxSession, error) {
-	tlsConn := tls.Client(conn, d.options.TLSConfig)
+	serverName := ""
+	if d.options.TLSConfig != nil {
+		serverName = d.options.TLSConfig.ServerName
+	}
+	cfg, err := d.md.ech.Apply(ctx, d.options.TLSConfig, serverName)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConn := tls.Client(conn, cfg)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		if rerr := d.md.ech.OnRejection(err, serverName); rerr != nil {
+			return nil, rerr
+		}
 		return nil, err
 	}
 	conn = tlsConn

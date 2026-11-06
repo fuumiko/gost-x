@@ -12,6 +12,7 @@ import (
 	"github.com/go-gost/core/recorder"
 	"github.com/go-gost/x/config"
 	"github.com/go-gost/x/internal/plugin"
+	xplugin "github.com/go-gost/x/plugin"
 	xrecorder "github.com/go-gost/x/recorder"
 	recorder_plugin "github.com/go-gost/x/recorder/plugin"
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -22,12 +23,20 @@ type discardCloser struct{}
 func (discardCloser) Write(p []byte) (n int, err error) { return len(p), nil }
 func (discardCloser) Close() error                      { return nil }
 
+// ParseRecorder converts a RecorderConfig into a recorder.Recorder. It
+// supports plugin backends (HTTP or gRPC), file output (with optional
+// rotation), TCP syslog-style delivery, HTTP POST delivery, and Redis storage
+// (set, list, or sorted set). Returns nil when cfg is nil or no backend is
+// configured.
 func ParseRecorder(cfg *config.RecorderConfig) (r recorder.Recorder) {
 	if cfg == nil {
 		return nil
 	}
 
 	if cfg.Plugin != nil {
+		if err := xplugin.Spawn(cfg.Plugin.Command); err != nil {
+			logger.Default().Errorf("spawn plugin %s: %v", cfg.Name, err)
+		}
 		var tlsCfg *tls.Config
 		if cfg.Plugin.TLS != nil {
 			tlsCfg = &tls.Config{
@@ -39,6 +48,7 @@ func ParseRecorder(cfg *config.RecorderConfig) (r recorder.Recorder) {
 		case "http":
 			return recorder_plugin.NewHTTPPlugin(
 				cfg.Name, cfg.Plugin.Addr,
+				plugin.TokenOption(cfg.Plugin.Token),
 				plugin.TLSConfigOption(tlsCfg),
 				plugin.TimeoutOption(cfg.Plugin.Timeout),
 			)

@@ -4,17 +4,27 @@ import (
 	"time"
 
 	mdata "github.com/go-gost/core/metadata"
-	mdutil "github.com/go-gost/x/metadata/util"
 	"github.com/go-gost/x/internal/util/mux"
+	mdutil "github.com/go-gost/x/metadata/util"
 )
 
 type metadata struct {
 	handshakeTimeout time.Duration
 	muxCfg           *mux.Config
+
+	keepalive         bool
+	keepaliveIdle     time.Duration
+	keepaliveInterval time.Duration
+	keepaliveCount    int
 }
 
 func (d *mtcpDialer) parseMetadata(md mdata.Metadata) (err error) {
 	d.md.handshakeTimeout = mdutil.GetDuration(md, "handshakeTimeout")
+
+	d.md.keepalive = mdutil.GetBool(md, "keepalive")
+	d.md.keepaliveIdle = mdutil.GetDuration(md, "keepalive.idle")
+	d.md.keepaliveInterval = mdutil.GetDuration(md, "keepalive.interval")
+	d.md.keepaliveCount = mdutil.GetInt(md, "keepalive.count")
 
 	d.md.muxCfg = &mux.Config{
 		Version:           mdutil.GetInt(md, "mux.version"),
@@ -24,6 +34,8 @@ func (d *mtcpDialer) parseMetadata(md mdata.Metadata) (err error) {
 		MaxFrameSize:      mdutil.GetInt(md, "mux.maxFrameSize"),
 		MaxReceiveBuffer:  mdutil.GetInt(md, "mux.maxReceiveBuffer"),
 		MaxStreamBuffer:   mdutil.GetInt(md, "mux.maxStreamBuffer"),
+		Type:              mdutil.GetString(md, "mux.type"),
+		MaxStreamWindow:   mdutil.GetInt(md, "mux.maxStreamWindow"),
 	}
 	if d.md.muxCfg.Version == 0 {
 		d.md.muxCfg.Version = 2

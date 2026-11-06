@@ -19,14 +19,31 @@ import (
 )
 
 var (
+	// ErrEmptyRoute is returned when the configured chain produces a route
+	// with no nodes.
 	ErrEmptyRoute = errors.New("empty route")
 )
 
+// retryableHandshaker is implemented by errors that signal the enclosing
+// chain hop may retry the handshake once (e.g. TLS ECH retry configs).
+type retryableHandshaker interface {
+	RetryableHandshake() bool
+}
+
+// isRetryableHandshake reports whether err (or any error it wraps) signals a
+// retryable handshake failure.
+func isRetryableHandshake(err error) bool {
+	var e retryableHandshaker
+	return errors.As(err, &e) && e.RetryableHandshake()
+}
+
 var (
+	// DefaultRoute is a fallback route that dials the target directly
+	// without going through any proxy nodes.
 	DefaultRoute chain.Route = &defaultRoute{}
 )
 
-// defaultRoute is a Route without nodes.
+// defaultRoute dials the target directly without any proxy nodes.
 type defaultRoute struct{}
 
 func (*defaultRoute) Dial(ctx context.Context, network, address string, opts ...chain.DialOption) (net.Conn, error) {
@@ -55,11 +72,9 @@ func (*defaultRoute) Bind(ctx context.Context, network, address string, opts ...
 
 	switch network {
 	case "tcp", "tcp4", "tcp6":
-		addr, err := net.ResolveTCPAddr(network, address)
-		if err != nil {
-			return nil, err
-		}
-		return net.ListenTCP(network, addr)
+		lc := net.ListenConfig{}
+		lc.SetMultipathTCP(false)
+		return lc.Listen(context.Background(), network, address)
 	case "udp", "udp4", "udp6":
 		addr, err := net.ResolveUDPAddr(network, address)
 		if err != nil {
@@ -82,6 +97,12 @@ func (*defaultRoute) Bind(ctx context.Context, network, address string, opts ...
 			Logger:         logger,
 		})
 		return ln, err
+	case "unix":
+		addr, err := net.ResolveUnixAddr(network, address)
+		if err != nil {
+			return nil, err
+		}
+		return net.ListenUnix(network, addr)
 	default:
 		err := fmt.Errorf("network %s unsupported", network)
 		return nil, err
@@ -98,6 +119,8 @@ type RouteOptions struct {
 
 type RouteOption func(*RouteOptions)
 
+// ChainRouteOption sets the parent chain on a route, enabling error
+// tracking and metrics for the chain.
 func ChainRouteOption(c chain.Chainer) RouteOption {
 	return func(o *RouteOptions) {
 		o.Chain = c
@@ -109,6 +132,7 @@ type chainRoute struct {
 	options RouteOptions
 }
 
+// NewRoute creates a new route with the given options.
 func NewRoute(opts ...RouteOption) *chainRoute {
 	var options RouteOptions
 	for _, opt := range opts {
@@ -217,7 +241,7 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 		}
 	}()
 
-	addr, err := xnet.Resolve(ctx, network, node.Addr, node.Options().Resolver, node.Options().HostMapper, logger)
+	addrs, err := xnet.ResolveAll(ctx, network, node.Addr, node.Options().Resolver, node.Options().HostMapper, logger)
 	marker := node.Marker()
 	if err != nil {
 		if marker != nil {
@@ -227,17 +251,47 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 	}
 
 	start := time.Now()
-	cc, err := node.Options().Transport.Dial(ctx, addr)
-	if err != nil {
-		if marker != nil {
-			marker.Mark()
+	var cn net.Conn
+	for _, addr := range orderCandidates(node.Addr, addrs) {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			return
 		}
-		return
+		for attempt := 0; ; attempt++ {
+			if ctx.Err() != nil {
+				err = ctx.Err()
+				break
+			}
+			cc, derr := node.Options().Transport.Dial(ctx, addr)
+			if derr != nil {
+				err = derr
+				// Dialers that complete the TLS handshake inside Dial (quic,
+				// grpc, h3, ...) report ECH retries from Dial, not Handshake.
+				if attempt == 0 && isRetryableHandshake(derr) {
+					continue
+				}
+				markAddrFailed(node.Addr, addr)
+				break
+			}
+			hn, herr := node.Options().Transport.Handshake(ctx, cc)
+			if herr == nil {
+				markAddrOK(node.Addr, addr)
+				cn, err = hn, nil
+				break
+			}
+			cc.Close()
+			err = herr
+			if attempt == 0 && isRetryableHandshake(herr) {
+				continue
+			}
+			markAddrFailed(node.Addr, addr)
+			break
+		}
+		if err == nil {
+			break
+		}
 	}
-
-	cn, err := node.Options().Transport.Handshake(ctx, cc)
 	if err != nil {
-		cc.Close()
 		if marker != nil {
 			marker.Mark()
 		}
@@ -259,6 +313,10 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 	}
 
 	preNode := node
+	var (
+		addr string
+		cc   net.Conn
+	)
 	for _, node := range r.nodes[1:] {
 		marker := node.Marker()
 		addr, err = xnet.Resolve(ctx, network, node.Addr, node.Options().Resolver, node.Options().HostMapper, logger)
@@ -271,20 +329,29 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 		}
 		cc, err = preNode.Options().Transport.Connect(ctx, cn, "tcp", addr)
 		if err != nil {
+			if cc != nil {
+				cc.Close()
+			}
 			cn.Close()
 			if marker != nil {
 				marker.Mark()
 			}
 			return
 		}
-		cc, err = node.Options().Transport.Handshake(ctx, cc)
+		var cc2 net.Conn
+		cc2, err = node.Options().Transport.Handshake(ctx, cc)
 		if err != nil {
+			if cc2 != nil {
+				cc2.Close()
+			}
+			cc.Close()
 			cn.Close()
 			if marker != nil {
 				marker.Mark()
 			}
 			return
 		}
+		cc = cc2
 		if marker != nil {
 			marker.Reset()
 		}

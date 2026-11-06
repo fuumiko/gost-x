@@ -9,6 +9,7 @@ import (
 	"github.com/go-gost/core/dialer"
 	md "github.com/go-gost/core/metadata"
 	xctx "github.com/go-gost/x/ctx"
+	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/net/proxyproto"
 	ws_util "github.com/go-gost/x/internal/util/ws"
 	"github.com/go-gost/x/registry"
@@ -50,7 +51,14 @@ func NewTLSDialer(opts ...dialer.Option) dialer.Dialer {
 }
 
 func (d *wsDialer) Init(md md.Metadata) (err error) {
-	return d.parseMetadata(md)
+	if err = d.parseMetadata(md); err != nil {
+		return err
+	}
+
+	if !d.tlsEnabled {
+		return nil
+	}
+	return d.md.ech.Init(d.options.Logger, d.options.TLSConfig)
 }
 
 func (d *wsDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialOption) (net.Conn, error) {
@@ -62,6 +70,17 @@ func (d *wsDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialOpt
 	conn, err := options.Dialer.Dial(ctx, "tcp", addr)
 	if err != nil {
 		d.options.Logger.Error(err)
+	}
+
+	xnet.ApplyNoDelay(conn)
+
+	if d.md.tcpKeepalive {
+		xnet.ApplyKeepalive(conn, net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     d.md.tcpKeepaliveIdle,
+			Interval: d.md.tcpKeepaliveInterval,
+			Count:    d.md.tcpKeepaliveCount,
+		})
 	}
 
 	conn = proxyproto.WrapClientConn(
@@ -103,11 +122,30 @@ func (d *wsDialer) Handshake(ctx context.Context, conn net.Conn, options ...dial
 	url := url.URL{Scheme: "ws", Host: host, Path: d.md.path}
 	if d.tlsEnabled {
 		url.Scheme = "wss"
-		dialer.TLSClientConfig = d.options.TLSConfig
+		serverName := ""
+		if d.options.TLSConfig != nil {
+			serverName = d.options.TLSConfig.ServerName
+		}
+		cfg, err := d.md.ech.Apply(ctx, d.options.TLSConfig, serverName)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		dialer.TLSClientConfig = cfg
 	}
 
 	c, resp, err := dialer.DialContext(ctx, url.String(), d.md.header)
 	if err != nil {
+		conn.Close()
+		if d.tlsEnabled {
+			serverName := ""
+			if d.options.TLSConfig != nil {
+				serverName = d.options.TLSConfig.ServerName
+			}
+			if rerr := d.md.ech.OnRejection(err, serverName); rerr != nil {
+				return nil, rerr
+			}
+		}
 		return nil, err
 	}
 	resp.Body.Close()

@@ -53,6 +53,7 @@ func (l *tlsListener) Init(md md.Metadata) (err error) {
 	}
 
 	lc := net.ListenConfig{}
+	lc.SetMultipathTCP(false)
 	if l.md.mptcp {
 		lc.SetMultipathTCP(true)
 		l.logger.Debugf("mptcp enabled: %v", lc.MultipathTCP())
@@ -61,6 +62,17 @@ func (l *tlsListener) Init(md md.Metadata) (err error) {
 	if err != nil {
 		return
 	}
+	if l.md.keepalive {
+		ln = xnet.WrapKeepaliveListener(ln, net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     l.md.keepaliveIdle,
+			Interval: l.md.keepaliveInterval,
+			Count:    l.md.keepaliveCount,
+		})
+		l.logger.Debugf("tcp keepalive enabled: idle=%v interval=%v count=%d",
+			l.md.keepaliveIdle, l.md.keepaliveInterval, l.md.keepaliveCount)
+	}
+	ln = xnet.WrapNoDelayListener(ln)
 	ln = proxyproto.WrapListener(l.options.ProxyProtocol, ln, 10*time.Second)
 	ln = metrics.WrapListener(l.options.Service, ln)
 	ln = stats.WrapListener(ln, l.options.Stats)

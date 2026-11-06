@@ -7,6 +7,22 @@ import (
 	"github.com/go-gost/core/observer/stats"
 )
 
+// LAN statistic kinds, defined here in x because core/ must stay untouched.
+// Core uses 1-5; 101+ is x-private space.
+const (
+	// LAN kinds count a tun hub's peer-LAN routing: what the hub refused,
+	// what it put into its table, and what it took out again. They are
+	// counted by the hub's RIB, not by the packet path, because the RIB is
+	// where those three decisions are actually made.
+	KindLanRouted    stats.Kind = 103
+	KindLanDenied    stats.Kind = 104
+	KindLanWithdrawn stats.Kind = 105
+)
+
+// Stats implements the stats.Stats interface using atomic counters.
+// When resetTraffic is true, Get for KindInputBytes and KindOutputBytes
+// atomically swaps the counter with zero, returning the value at the time
+// of the call.
 type Stats struct {
 	updated      atomic.Bool
 	totalConns   atomic.Uint64
@@ -14,9 +30,15 @@ type Stats struct {
 	inputBytes   atomic.Uint64
 	outputBytes  atomic.Uint64
 	totalErrs    atomic.Uint64
+	lanRouted    atomic.Uint64
+	lanDenied    atomic.Uint64
+	lanWithdrawn atomic.Uint64
 	resetTraffic bool
 }
 
+// NewStats creates a new Stats instance. When resetTraffic is true, calls
+// to Get for KindInputBytes and KindOutputBytes atomically reset the counter
+// to zero after reading, which is useful for rate calculations.
 func NewStats(resetTraffic bool) stats.Stats {
 	return &Stats{
 		resetTraffic: resetTraffic,
@@ -41,6 +63,18 @@ func (s *Stats) Add(kind stats.Kind, n int64) {
 	case stats.KindTotalErrs:
 		if n > 0 {
 			s.totalErrs.Add(uint64(n))
+		}
+	case KindLanRouted:
+		if n > 0 {
+			s.lanRouted.Add(uint64(n))
+		}
+	case KindLanDenied:
+		if n > 0 {
+			s.lanDenied.Add(uint64(n))
+		}
+	case KindLanWithdrawn:
+		if n > 0 {
+			s.lanWithdrawn.Add(uint64(n))
 		}
 	}
 	s.updated.Store(true)
@@ -68,6 +102,12 @@ func (s *Stats) Get(kind stats.Kind) uint64 {
 		return s.outputBytes.Load()
 	case stats.KindTotalErrs:
 		return s.totalErrs.Load()
+	case KindLanRouted:
+		return s.lanRouted.Load()
+	case KindLanDenied:
+		return s.lanDenied.Load()
+	case KindLanWithdrawn:
+		return s.lanWithdrawn.Load()
 	}
 	return 0
 }
@@ -79,12 +119,17 @@ func (s *Stats) Reset() {
 	s.inputBytes.Store(0)
 	s.outputBytes.Store(0)
 	s.totalErrs.Store(0)
+	s.lanRouted.Store(0)
+	s.lanDenied.Store(0)
+	s.lanWithdrawn.Store(0)
 }
 
 func (s *Stats) IsUpdated() bool {
 	return s.updated.Swap(false)
 }
 
+// StatsEvent carries a snapshot of all tracked statistics for a specific
+// service and optional client. It implements observer.Event.
 type StatsEvent struct {
 	Kind    string
 	Service string
@@ -97,6 +142,7 @@ type StatsEvent struct {
 	TotalErrs    uint64
 }
 
+// Type returns observer.EventStats to identify this as a statistics event.
 func (StatsEvent) Type() observer.EventType {
 	return observer.EventStats
 }

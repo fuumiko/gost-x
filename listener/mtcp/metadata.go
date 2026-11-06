@@ -1,6 +1,8 @@
 package mtcp
 
 import (
+	"time"
+
 	md "github.com/go-gost/core/metadata"
 	"github.com/go-gost/x/internal/util/mux"
 	mdutil "github.com/go-gost/x/metadata/util"
@@ -11,13 +13,19 @@ const (
 )
 
 type metadata struct {
-	mptcp   bool
-	muxCfg  *mux.Config
-	backlog int
+	mptcp             bool
+	reuseport         bool
+	muxCfg            *mux.Config
+	backlog           int
+	keepalive         bool
+	keepaliveIdle     time.Duration
+	keepaliveInterval time.Duration
+	keepaliveCount    int
 }
 
 func (l *mtcpListener) parseMetadata(md md.Metadata) (err error) {
 	l.md.mptcp = mdutil.GetBool(md, "mptcp")
+	l.md.reuseport = mdutil.GetBool(md, "reuseport")
 
 	l.md.muxCfg = &mux.Config{
 		Version:           mdutil.GetInt(md, "mux.version"),
@@ -27,6 +35,8 @@ func (l *mtcpListener) parseMetadata(md md.Metadata) (err error) {
 		MaxFrameSize:      mdutil.GetInt(md, "mux.maxFrameSize"),
 		MaxReceiveBuffer:  mdutil.GetInt(md, "mux.maxReceiveBuffer"),
 		MaxStreamBuffer:   mdutil.GetInt(md, "mux.maxStreamBuffer"),
+		Type:              mdutil.GetString(md, "mux.type"),
+		MaxStreamWindow:   mdutil.GetInt(md, "mux.maxStreamWindow"),
 	}
 	if l.md.muxCfg.Version == 0 {
 		l.md.muxCfg.Version = 2
@@ -37,5 +47,9 @@ func (l *mtcpListener) parseMetadata(md md.Metadata) (err error) {
 		l.md.backlog = defaultBacklog
 	}
 
+	l.md.keepalive = mdutil.GetBool(md, "keepalive")
+	l.md.keepaliveIdle = mdutil.GetDuration(md, "keepalive.idle")
+	l.md.keepaliveInterval = mdutil.GetDuration(md, "keepalive.interval")
+	l.md.keepaliveCount = mdutil.GetInt(md, "keepalive.count")
 	return
 }

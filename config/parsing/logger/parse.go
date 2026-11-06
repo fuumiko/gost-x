@@ -3,7 +3,6 @@ package logger
 import (
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/go-gost/core/logger"
 	"github.com/go-gost/x/config"
@@ -12,6 +11,9 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+// ParseLogger converts a LoggerConfig into a logger.Logger. It configures
+// output destination (stderr, stdout, file, or discard), log level, format,
+// and optional log rotation via lumberjack.
 func ParseLogger(cfg *config.LoggerConfig) logger.Logger {
 	if cfg == nil || cfg.Log == nil {
 		return nil
@@ -22,8 +24,34 @@ func ParseLogger(cfg *config.LoggerConfig) logger.Logger {
 		xlogger.LevelOption(logger.LogLevel(cfg.Log.Level)),
 	}
 
+	opts = append(opts, xlogger.OutputOption(outputWriter(cfg.Log)))
+
+	return xlogger.NewLogger(opts...)
+}
+
+// defaultLogRotation is what a file log gets when its config leaves the
+// rotation out. It matches what an unconfigured logger has always carried, so
+// a log: section that names an output but no rotation is not a way to ask for
+// an unbounded file.
+//
+// The reason this is a default rather than a warning: an unrotated debug log
+// is not untidy, it stops the device. A spoke's log section with no rotation:
+// key grew to 111MB with no backups, on a phone.
+func defaultLogRotation() *config.LogRotationConfig {
+	return &config.LogRotationConfig{
+		MaxSize:    10,
+		MaxAge:     7,
+		MaxBackups: 10,
+		LocalTime:  true,
+	}
+}
+
+// outputWriter resolves the LogConfig's output to the writer that receives the
+// lines. Split out of ParseLogger so the rotation decision — the part that
+// decides whether a file log stops growing — is reachable without a logger.
+func outputWriter(cfg *config.LogConfig) io.Writer {
 	var out io.Writer = os.Stderr
-	switch cfg.Log.Output {
+	switch cfg.Output {
 	case "none", "null":
 		out = io.Discard
 	case "stdout":
@@ -31,30 +59,23 @@ func ParseLogger(cfg *config.LoggerConfig) logger.Logger {
 	case "stderr", "":
 		out = os.Stderr
 	default:
-		if cfg.Log.Rotation != nil {
-			out = &lumberjack.Logger{
-				Filename:   cfg.Log.Output,
-				MaxSize:    cfg.Log.Rotation.MaxSize,
-				MaxAge:     cfg.Log.Rotation.MaxAge,
-				MaxBackups: cfg.Log.Rotation.MaxBackups,
-				LocalTime:  cfg.Log.Rotation.LocalTime,
-				Compress:   cfg.Log.Rotation.Compress,
-			}
-		} else {
-			os.MkdirAll(filepath.Dir(cfg.Log.Output), 0755)
-			f, err := os.OpenFile(cfg.Log.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-			if err != nil {
-				logger.Default().Warn(err)
-			} else {
-				out = f
-			}
+		if cfg.Rotation == nil {
+			cfg.Rotation = defaultLogRotation()
+		}
+		out = &lumberjack.Logger{
+			Filename:   cfg.Output,
+			MaxSize:    cfg.Rotation.MaxSize,
+			MaxAge:     cfg.Rotation.MaxAge,
+			MaxBackups: cfg.Rotation.MaxBackups,
+			LocalTime:  cfg.Rotation.LocalTime,
+			Compress:   cfg.Rotation.Compress,
 		}
 	}
-	opts = append(opts, xlogger.OutputOption(out))
-
-	return xlogger.NewLogger(opts...)
+	return out
 }
 
+// List resolves one or more logger names from the registry. It returns only
+// the loggers that were found, skipping any that are not registered.
 func List(name string, names ...string) []logger.Logger {
 	var loggers []logger.Logger
 	if adm := registry.LoggerRegistry().Get(name); adm != nil {

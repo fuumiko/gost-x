@@ -2,11 +2,13 @@ package ss
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
 
-	"github.com/go-gost/core/common/bufpool"
+	"strings"
+
 	"github.com/go-gost/core/connector"
 	md "github.com/go-gost/core/metadata"
 	"github.com/go-gost/go-shadowsocks2/core"
@@ -14,6 +16,7 @@ import (
 	"github.com/go-gost/go-shadowsocks2/utils"
 	"github.com/go-gost/gosocks5"
 	ctxvalue "github.com/go-gost/x/ctx"
+	"github.com/go-gost/x/internal/util/ss/none"
 	"github.com/go-gost/x/registry"
 )
 
@@ -43,17 +46,24 @@ func (c *ssConnector) Init(md md.Metadata) (err error) {
 		return
 	}
 
-	if c.options.Auth != nil {
-		method := c.options.Auth.Username()
-		password, _ := c.options.Auth.Password()
-
-		clientConfig, err := utils.NewClientConfig(method, password)
-		if err != nil {
-			return nil
-		}
-
-		c.client = core.NewTCPClient(clientConfig)
+	if c.options.Auth == nil {
+		return errors.New("ss: auth is required")
 	}
+
+	method := c.options.Auth.Username()
+	password, _ := c.options.Auth.Password()
+
+	if strings.EqualFold(method, "none") || strings.EqualFold(method, "dummy") {
+		c.client = core.NewTCPClient(core.ClientConfig{Cipher: none.Cipher})
+		return
+	}
+
+	clientConfig, err := utils.NewClientConfig(method, password)
+	if err != nil {
+		return err
+	}
+
+	c.client = core.NewTCPClient(clientConfig)
 
 	return
 }
@@ -86,10 +96,13 @@ func (c *ssConnector) Connect(ctx context.Context, conn net.Conn, network, addre
 		log.Error(err)
 		return nil, err
 	}
-	rawaddr := bufpool.Get(512)
-	defer bufpool.Put(rawaddr)
+	// The wrapped conn stores this target and only writes it on first I/O,
+	// so it must be owned by this connection, not a shared pooled buffer
+	// (see go-gost/gost#896).
+	const maxAddrLen = 1 + 1 + 255 + 2 // SOCKS5 addr: atyp + len + host + port
 
-	n, err := addr.Encode(rawaddr)
+	target := make([]byte, maxAddrLen)
+	n, err := addr.Encode(target)
 	if err != nil {
 		log.Error("encoding addr: ", err)
 		return nil, err
@@ -100,20 +113,10 @@ func (c *ssConnector) Connect(ctx context.Context, conn net.Conn, network, addre
 		defer conn.SetDeadline(time.Time{})
 	}
 
-	target := socks.Addr(rawaddr[:n])
-	conn, err = c.client.WrapConn(conn, target)
+	conn, err = c.client.WrapConn(conn, socks.Addr(target[:n]))
 	if err != nil {
 		return nil, err
 	}
 
-	var sc net.Conn
-	if c.md.noDelay {
-		err := conn.(core.TCPConn).ClientFirstWrite()
-		if err != nil {
-			return nil, err
-		}
-	}
-	sc = conn
-
-	return sc, nil
+	return conn, nil
 }

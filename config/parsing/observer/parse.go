@@ -4,17 +4,25 @@ import (
 	"crypto/tls"
 	"strings"
 
+	"github.com/go-gost/core/logger"
 	"github.com/go-gost/core/observer"
 	"github.com/go-gost/x/config"
 	"github.com/go-gost/x/internal/plugin"
 	observer_plugin "github.com/go-gost/x/observer/plugin"
+	xplugin "github.com/go-gost/x/plugin"
 )
 
+// ParseObserver converts an ObserverConfig into an observer.Observer. It only
+// supports plugin backends (HTTP or gRPC); returns nil when cfg or cfg.Plugin
+// is nil.
 func ParseObserver(cfg *config.ObserverConfig) observer.Observer {
 	if cfg == nil || cfg.Plugin == nil {
 		return nil
 	}
 
+	if err := xplugin.Spawn(cfg.Plugin.Command); err != nil {
+		logger.Default().Errorf("spawn plugin %s: %v", cfg.Name, err)
+	}
 	var tlsCfg *tls.Config
 	if cfg.Plugin.TLS != nil {
 		tlsCfg = &tls.Config{
@@ -26,6 +34,7 @@ func ParseObserver(cfg *config.ObserverConfig) observer.Observer {
 	case "http":
 		return observer_plugin.NewHTTPPlugin(
 			cfg.Name, cfg.Plugin.Addr,
+			plugin.TokenOption(cfg.Plugin.Token),
 			plugin.TLSConfigOption(tlsCfg),
 			plugin.TimeoutOption(cfg.Plugin.Timeout),
 		)

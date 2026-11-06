@@ -1,3 +1,6 @@
+// Package util provides typed accessor functions for reading values from a
+// metadata.Metadata store. Each getter accepts one or more fallback keys and
+// returns the first match. All functions are nil-safe on the metadata argument.
 package util
 
 import (
@@ -8,6 +11,8 @@ import (
 	"github.com/go-gost/core/metadata"
 )
 
+// IsExists reports whether at least one of the given keys is present in md.
+// Returns false if md is nil.
 func IsExists(md metadata.Metadata, keys ...string) bool {
 	if md == nil {
 		return false
@@ -21,6 +26,9 @@ func IsExists(md metadata.Metadata, keys ...string) bool {
 	return false
 }
 
+// GetBool returns the bool value for the first matching key. String values are
+// parsed with strconv.ParseBool, and non-zero integers are treated as true.
+// Returns false if md is nil or no key matches.
 func GetBool(md metadata.Metadata, keys ...string) (v bool) {
 	if md == nil {
 		return
@@ -45,6 +53,9 @@ func GetBool(md metadata.Metadata, keys ...string) (v bool) {
 	return
 }
 
+// GetInt returns the int value for the first matching key. String values are
+// parsed with strconv.Atoi, and true/false booleans are treated as 1/0.
+// Returns 0 if md is nil or no key matches.
 func GetInt(md metadata.Metadata, keys ...string) (v int) {
 	if md == nil {
 		return
@@ -71,6 +82,9 @@ func GetInt(md metadata.Metadata, keys ...string) (v int) {
 	return
 }
 
+// GetFloat returns the float64 value for the first matching key. String values
+// are parsed with strconv.ParseFloat, float32 values are promoted, and int
+// values are converted. Returns 0 if md is nil or no key matches.
 func GetFloat(md metadata.Metadata, keys ...string) (v float64) {
 	if md == nil {
 		return
@@ -83,6 +97,8 @@ func GetFloat(md metadata.Metadata, keys ...string) (v float64) {
 		}
 
 		switch val := vv.(type) {
+		case float32:
+			v = float64(val)
 		case float64:
 			v = val
 		case int:
@@ -95,6 +111,10 @@ func GetFloat(md metadata.Metadata, keys ...string) (v float64) {
 	return
 }
 
+// GetDuration returns the time.Duration value for the first matching key.
+// String values are parsed with time.ParseDuration; if that fails they are
+// retried as integer seconds via strconv.Atoi. Integer values are treated as
+// seconds. Returns 0 if md is nil or no key matches.
 func GetDuration(md metadata.Metadata, keys ...string) (v time.Duration) {
 	if md == nil {
 		return
@@ -121,6 +141,9 @@ func GetDuration(md metadata.Metadata, keys ...string) (v time.Duration) {
 	return
 }
 
+// GetString returns the string value for the first matching key. Non-string
+// values (int, int64, uint, uint64, bool, float32, float64) are formatted via
+// strconv. Returns "" if md is nil or no key matches.
 func GetString(md metadata.Metadata, keys ...string) (v string) {
 	if md == nil {
 		return
@@ -156,6 +179,9 @@ func GetString(md metadata.Metadata, keys ...string) (v string) {
 	return
 }
 
+// GetStrings returns the []string value for the first matching key. []any
+// slices are converted element-by-element, skipping non-string values.
+// Returns nil if md is nil or no key matches.
 func GetStrings(md metadata.Metadata, keys ...string) (ss []string) {
 	if md == nil {
 		return
@@ -182,6 +208,9 @@ func GetStrings(md metadata.Metadata, keys ...string) (ss []string) {
 	return
 }
 
+// GetStringMap returns the map[string]any value for the first matching key.
+// map[any]any values are converted by formatting keys with %v. Returns nil if
+// md is nil or no key matches.
 func GetStringMap(md metadata.Metadata, keys ...string) (m map[string]any) {
 	if md == nil {
 		return
@@ -207,6 +236,9 @@ func GetStringMap(md metadata.Metadata, keys ...string) (m map[string]any) {
 	return
 }
 
+// GetStringMapString returns the map[string]string value for the first matching
+// key. Both map[string]any and map[any]any values are converted by formatting
+// values with %v. Returns nil if md is nil or no key matches.
 func GetStringMapString(md metadata.Metadata, keys ...string) (m map[string]string) {
 	if md == nil {
 		return

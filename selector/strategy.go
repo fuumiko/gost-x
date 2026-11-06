@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	
 
 	"github.com/go-gost/core/logger"
 	"github.com/go-gost/core/metadata"
@@ -92,6 +93,9 @@ type hashStrategy[T any] struct {
 	mu sync.Mutex
 }
 
+// HashStrategy is a strategy for node selector.
+// The node will be selected by hashing the client ID or hash source
+// from the context. Falls back to random selection when neither is available.
 func HashStrategy[T any]() selector.Strategy[T] {
 	return &hashStrategy[T]{
 		r: rand.New(rand.NewSource(time.Now().UnixNano())),
@@ -102,6 +106,13 @@ func (s *hashStrategy[T]) Apply(ctx context.Context, vs ...T) (v T) {
 	if len(vs) == 0 {
 		return
 	}
+
+	if clientID := xctx.ClientIDFromContext(ctx); clientID != "" {
+		value := uint64(crc32.ChecksumIEEE([]byte(string(clientID))))
+		logger.Default().Tracef("hash client %s %d", clientID, value)
+		return vs[value%uint64(len(vs))]
+	}
+
 	if h := xctx.HashFromContext(ctx); h != nil {
 		value := uint64(crc32.ChecksumIEEE([]byte(h.Source)))
 		logger.Default().Tracef("hash %s %d", h.Source, value)

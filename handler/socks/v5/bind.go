@@ -10,6 +10,7 @@ import (
 	"github.com/go-gost/core/observer/stats"
 	"github.com/go-gost/gosocks5"
 	xctx "github.com/go-gost/x/ctx"
+	ictx "github.com/go-gost/x/internal/ctx"
 	xnet "github.com/go-gost/x/internal/net"
 	traffic_wrapper "github.com/go-gost/x/limiter/traffic/wrapper"
 	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
@@ -63,6 +64,7 @@ func (h *socks5Handler) bindLocal(ctx context.Context, conn net.Conn, network, a
 	lc := xnet.ListenConfig{
 		Netns: h.options.Netns,
 	}
+	lc.ListenConfig.SetMultipathTCP(false)
 	ln, err := lc.Listen(ctx, network, address) // strict mode: if the port already in use, it will return error
 	if err != nil {
 		log.Error(err)
@@ -79,6 +81,7 @@ func (h *socks5Handler) bindLocal(ctx context.Context, conn net.Conn, network, a
 		"bind": ln.Addr().String(),
 	})
 	ro.SrcAddr = ln.Addr().String()
+	ictx.SessionFromContext(ctx).Start(*ro)
 
 	socksAddr := gosocks5.Addr{}
 	if err := socksAddr.ParseFrom(ln.Addr().String()); err != nil {
