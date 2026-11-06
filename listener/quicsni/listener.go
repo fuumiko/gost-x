@@ -9,7 +9,6 @@ import (
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
 	xnet "github.com/go-gost/x/internal/net"
-	"github.com/go-gost/x/internal/net/udp"
 	admission "github.com/go-gost/x/admission/wrapper"
 	traffic_limiter "github.com/go-gost/x/limiter/traffic"
 	limiter_wrapper "github.com/go-gost/x/limiter/traffic/wrapper"
@@ -23,7 +22,10 @@ func init() {
 }
 
 type quicsniListener struct {
-	ln      net.Listener
+	addr    net.Addr
+	pc      net.PacketConn
+	connCh  chan net.Conn
+	done    chan struct{}
 	logger  logger.Logger
 	md      metadata
 	options listener.Options
@@ -59,8 +61,7 @@ func (l *quicsniListener) Init(md md.Metadata) (err error) {
 		return
 	}
 
-	var conn *net.UDPConn
-	conn, err = net.ListenUDP(network, laddr)
+	conn, err := net.ListenUDP(network, laddr)
 	if err != nil {
 		return
 	}
@@ -69,6 +70,8 @@ func (l *quicsniListener) Init(md md.Metadata) (err error) {
 		conn.SetReadBuffer(l.md.socketBufferSize)
 		conn.SetWriteBuffer(l.md.socketBufferSize)
 	}
+
+	l.addr = conn.LocalAddr()
 
 	var pc net.PacketConn = conn
 	pc = metrics.WrapPacketConn(l.options.Service, pc)
@@ -82,40 +85,55 @@ func (l *quicsniListener) Init(md md.Metadata) (err error) {
 		limiter.ServiceOption(l.options.Service),
 		limiter.NetworkOption(pc.LocalAddr().Network()),
 	)
+	l.pc = pc
 
-	l.ln = udp.NewListener(pc, &udp.ListenConfig{
-		Backlog:        l.md.backlog,
-		ReadQueueSize:  l.md.readQueueSize,
-		ReadBufferSize: l.md.readBufferSize,
-		TTL:            l.md.ttl,
-		Keepalive:      true,
-		Logger:         l.logger,
-	})
+	// Deliver the PacketConn once to the handler via Accept().
+	l.connCh = make(chan net.Conn, 1)
+	l.done = make(chan struct{})
+	l.connCh <- &packetConnWrapper{PacketConn: pc}
 
 	return
 }
 
-func (l *quicsniListener) Accept() (conn net.Conn, err error) {
-	conn, err = l.ln.Accept()
-	if err != nil {
-		return
+// Accept returns the underlying PacketConn exactly once.
+// Subsequent calls block until Close.
+func (l *quicsniListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.connCh:
+		return conn, nil
+	case <-l.done:
+		return nil, listener.ErrClosed
 	}
-	conn = limiter_wrapper.WrapConn(
-		conn,
-		l.options.TrafficLimiter,
-		conn.RemoteAddr().String(),
-		limiter.ScopeOption(limiter.ScopeConn),
-		limiter.ServiceOption(l.options.Service),
-		limiter.NetworkOption(conn.LocalAddr().Network()),
-		limiter.SrcOption(conn.RemoteAddr().String()),
-	)
-	return
 }
 
 func (l *quicsniListener) Addr() net.Addr {
-	return l.ln.Addr()
+	return l.addr
 }
 
 func (l *quicsniListener) Close() error {
-	return l.ln.Close()
+	select {
+	case <-l.done:
+	default:
+		close(l.done)
+	}
+	return l.pc.Close()
+}
+
+// packetConnWrapper bridges net.PacketConn to net.Conn
+// so it can pass through the Accept/Handle interface.
+type packetConnWrapper struct {
+	net.PacketConn
+}
+
+func (c *packetConnWrapper) Read(b []byte) (int, error) {
+	n, _, err := c.ReadFrom(b)
+	return n, err
+}
+
+func (c *packetConnWrapper) Write(b []byte) (int, error) {
+	return 0, net.ErrWriteToConnected
+}
+
+func (c *packetConnWrapper) RemoteAddr() net.Addr {
+	return nil
 }

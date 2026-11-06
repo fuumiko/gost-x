@@ -9,12 +9,12 @@ import (
 
 const (
 	defaultReadBufferSize = 4096
-	defaultReadTimeout    = 15 * time.Second
+	defaultTTL            = 90 * time.Second
 )
 
 type metadata struct {
 	readBufferSize int
-	readTimeout    time.Duration
+	ttl            time.Duration
 }
 
 func (h *quicsniHandler) parseMetadata(md mdata.Metadata) (err error) {
@@ -23,9 +23,9 @@ func (h *quicsniHandler) parseMetadata(md mdata.Metadata) (err error) {
 		h.md.readBufferSize = defaultReadBufferSize
 	}
 
-	h.md.readTimeout = mdutil.GetDuration(md, "readTimeout")
-	if h.md.readTimeout <= 0 {
-		h.md.readTimeout = defaultReadTimeout
+	h.md.ttl = mdutil.GetDuration(md, "ttl")
+	if h.md.ttl <= 0 {
+		h.md.ttl = defaultTTL
 	}
 
 	return

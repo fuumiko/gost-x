@@ -1,26 +1,19 @@
 package quicsni
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-gost/core/chain"
 	"github.com/go-gost/core/handler"
 	"github.com/go-gost/core/hop"
+	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
-	"github.com/go-gost/core/observer/stats"
-	"github.com/go-gost/core/recorder"
-	xctx "github.com/go-gost/x/ctx"
-	ictx "github.com/go-gost/x/internal/ctx"
-	xnet "github.com/go-gost/x/internal/net"
 	quicsniff "github.com/go-gost/x/internal/util/quic/sniff"
-	rate_limiter "github.com/go-gost/x/limiter/rate"
-	xstats "github.com/go-gost/x/observer/stats"
-	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
-	xrecorder "github.com/go-gost/x/recorder"
 	"github.com/go-gost/x/registry"
 )
 
@@ -29,10 +22,9 @@ func init() {
 }
 
 type quicsniHandler struct {
-	hop      hop.Hop
-	md       metadata
-	options  handler.Options
-	recorder recorder.RecorderObject
+	hop     hop.Hop
+	md      metadata
+	options handler.Options
 }
 
 func NewHandler(opts ...handler.Option) handler.Handler {
@@ -46,18 +38,7 @@ func NewHandler(opts ...handler.Option) handler.Handler {
 }
 
 func (h *quicsniHandler) Init(md md.Metadata) (err error) {
-	if err = h.parseMetadata(md); err != nil {
-		return
-	}
-
-	for _, ro := range h.options.Recorders {
-		if ro.Record == xrecorder.RecorderServiceHandler {
-			h.recorder = ro
-			break
-		}
-	}
-
-	return
+	return h.parseMetadata(md)
 }
 
 // Forward implements handler.Forwarder.
@@ -65,80 +46,71 @@ func (h *quicsniHandler) Forward(hop hop.Hop) {
 	h.hop = hop
 }
 
-func (h *quicsniHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.HandleOption) (err error) {
+type session struct {
+	backend    net.Conn
+	clientAddr net.Addr
+	lastSeen   atomic.Int64 // UnixNano
+}
+
+// Handle receives the raw PacketConn from the listener and runs
+// a direct packet relay loop. Each unique client address becomes
+// a session with its own backend connection and reverse-relay goroutine.
+func (h *quicsniHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler.HandleOption) error {
 	defer conn.Close()
 
-	start := time.Now()
-
-	ro := &xrecorder.HandlerRecorderObject{
-		Service:    h.options.Service,
-		RemoteAddr: conn.RemoteAddr().String(),
-		LocalAddr:  conn.LocalAddr().String(),
-		Network:    "udp",
-		Time:       start,
-		SID:        xctx.SidFromContext(ctx).String(),
+	pc, ok := conn.(net.PacketConn)
+	if !ok {
+		return errors.New("quicsni: expected PacketConn")
 	}
 
-	if srcAddr := xctx.SrcAddrFromContext(ctx); srcAddr != nil {
-		ro.ClientAddr = srcAddr.String()
-	}
+	log := h.options.Logger
+	log.Infof("quicsni relay on %s", conn.LocalAddr())
 
-	log := h.options.Logger.WithFields(map[string]any{
-		"remote": conn.RemoteAddr().String(),
-		"local":  conn.LocalAddr().String(),
-		"client": ro.ClientAddr,
-		"sid":    ro.SID,
-	})
+	var sessions sync.Map
 
-	pStats := xstats.Stats{}
-	conn = stats_wrapper.WrapConn(conn, &pStats)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	defer func() {
-		if err != nil {
-			ro.Err = err.Error()
-		}
-		ro.InputBytes = pStats.Get(stats.KindInputBytes)
-		ro.OutputBytes = pStats.Get(stats.KindOutputBytes)
-		ro.Duration = time.Since(start)
-		if err := ro.Record(ctx, h.recorder.Recorder); err != nil {
-			log.Errorf("record: %v", err)
-		}
+	go h.cleanupLoop(ctx, &sessions, log)
 
-		log.WithFields(map[string]any{
-			"duration":    time.Since(start),
-			"inputBytes":  ro.InputBytes,
-			"outputBytes": ro.OutputBytes,
-		}).Infof("%s >< %s", conn.RemoteAddr(), conn.LocalAddr())
-	}()
-
-	if !h.checkRateLimit(conn.RemoteAddr()) {
-		return rate_limiter.ErrRateLimit
-	}
-
-	// Read first packet to attempt SNI extraction.
 	buf := make([]byte, h.md.readBufferSize)
-	if h.md.readTimeout > 0 {
-		conn.SetReadDeadline(time.Now().Add(h.md.readTimeout))
-	}
-	n, err := conn.Read(buf)
-	if err != nil {
-		log.Error("read first packet: ", err)
-		return err
-	}
-	if h.md.readTimeout > 0 {
-		conn.SetReadDeadline(time.Time{})
-	}
+	for {
+		n, raddr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return err
+		}
 
-	// Best-effort SNI extraction from QUIC Initial.
-	host := quicsniff.ExtractSNI(buf[:n])
-	ro.Host = host
+		key := raddr.String()
+		now := time.Now().UnixNano()
 
-	log = log.WithFields(map[string]any{
-		"host": host,
-	})
-	log.Debugf("%s >> quicsni (sni=%s)", conn.RemoteAddr(), host)
+		// Fast path: existing session.
+		if si, ok := sessions.Load(key); ok {
+			sess := si.(*session)
+			sess.lastSeen.Store(now)
+			if _, err := sess.backend.Write(buf[:n]); err != nil {
+				// Stale session; remove and let the client retransmit.
+				sessions.Delete(key)
+			}
+			continue
+		}
 
-	// Select backend via hop.
+		// Slow path: new session.
+		h.newSession(ctx, pc, buf[:n], raddr, key, now, &sessions, log)
+	}
+}
+
+func (h *quicsniHandler) newSession(
+	ctx context.Context,
+	pc net.PacketConn,
+	firstPacket []byte,
+	raddr net.Addr,
+	key string,
+	now int64,
+	sessions *sync.Map,
+	log logger.Logger,
+) {
+	host := quicsniff.ExtractSNI(firstPacket)
+
 	target := &chain.Node{}
 	if h.hop != nil {
 		selectOpts := []hop.SelectOption{
@@ -150,62 +122,92 @@ func (h *quicsniHandler) Handle(ctx context.Context, conn net.Conn, opts ...hand
 		target = h.hop.Select(ctx, selectOpts...)
 	}
 	if target == nil {
-		err = errors.New("node not available")
-		log.Error(err)
-		return err
+		log.Warnf("quicsni: no target for %s (sni=%s)", raddr, host)
+		return
 	}
 
-	addr := target.Addr
-	ro.DstAddr = addr
-
-	log = log.WithFields(map[string]any{
-		"node": target.Name,
-		"dst":  addr,
-	})
-	log.Debugf("%s >> %s", conn.RemoteAddr(), addr)
-
-	// Dial backend.
-	var routeBuf bytes.Buffer
-	cc, err := h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &routeBuf), "udp", addr)
-	ro.Route = routeBuf.String()
+	cc, err := h.options.Router.Dial(ctx, "udp", target.Addr)
 	if err != nil {
-		log.Error(err)
+		log.Errorf("quicsni: dial %s: %v", target.Addr, err)
 		if marker := target.Marker(); marker != nil {
 			marker.Mark()
 		}
-		return err
+		return
 	}
 	if marker := target.Marker(); marker != nil {
 		marker.Reset()
 	}
-	defer cc.Close()
 
-	// Forward the first packet.
-	if _, err := cc.Write(buf[:n]); err != nil {
-		log.Error("write first packet: ", err)
-		return err
+	sess := &session{
+		backend:    cc,
+		clientAddr: raddr,
+	}
+	sess.lastSeen.Store(now)
+	sessions.Store(key, sess)
+
+	log.Debugf("quicsni: %s -> %s (sni=%s)", raddr, target.Addr, host)
+
+	if _, err := cc.Write(firstPacket); err != nil {
+		cc.Close()
+		sessions.Delete(key)
+		return
 	}
 
-	log.Infof("%s <-> %s", conn.RemoteAddr(), addr)
-	t := time.Now()
-
-	// Bidirectional pipe for remaining packets.
-	xnet.Pipe(ctx, conn, cc)
-
-	log.WithFields(map[string]any{
-		"duration": time.Since(t),
-	}).Infof("%s >-< %s", conn.RemoteAddr(), addr)
-
-	return nil
+	go h.reverseRelay(pc, sess, sessions, key, log)
 }
 
-func (h *quicsniHandler) checkRateLimit(addr net.Addr) bool {
-	if h.options.RateLimiter == nil {
-		return true
+// reverseRelay forwards packets from the backend back to the client.
+func (h *quicsniHandler) reverseRelay(
+	pc net.PacketConn,
+	sess *session,
+	sessions *sync.Map,
+	key string,
+	log logger.Logger,
+) {
+	defer func() {
+		sess.backend.Close()
+		sessions.Delete(key)
+		log.Debugf("quicsni: closed %s", key)
+	}()
+
+	buf := make([]byte, h.md.readBufferSize)
+	for {
+		n, err := sess.backend.Read(buf)
+		if err != nil {
+			return
+		}
+		sess.lastSeen.Store(time.Now().UnixNano())
+		if _, err := pc.WriteTo(buf[:n], sess.clientAddr); err != nil {
+			return
+		}
 	}
-	host, _, _ := net.SplitHostPort(addr.String())
-	if limiter := h.options.RateLimiter.Limiter(host); limiter != nil {
-		return limiter.Allow(1)
+}
+
+// cleanupLoop periodically removes idle sessions.
+func (h *quicsniHandler) cleanupLoop(ctx context.Context, sessions *sync.Map, log logger.Logger) {
+	ticker := time.NewTicker(h.md.ttl)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now().UnixNano()
+			ttlNano := int64(h.md.ttl)
+			sessions.Range(func(key, value any) bool {
+				sess := value.(*session)
+				if now-sess.lastSeen.Load() > ttlNano {
+					log.Debugf("quicsni: idle %s", key)
+					sess.backend.Close()
+					sessions.Delete(key)
+				}
+				return true
+			})
+		case <-ctx.Done():
+			sessions.Range(func(key, value any) bool {
+				value.(*session).backend.Close()
+				return true
+			})
+			return
+		}
 	}
-	return true
 }
